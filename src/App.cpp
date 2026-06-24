@@ -687,7 +687,13 @@ void ReticuleM::runCompose() {
             y += 12;
         }
 
-        drawFooter("Tab:field  Fn+Enter:send  `=Esc");
+        // Footer with character count
+        char footerBuf[80];
+        int bodyLen = strlen(composeBody);
+        int maxBody = (int)sizeof(composeBody) - 1;
+        snprintf(footerBuf, sizeof(footerBuf),
+            "Tab:field  %d/%d  Fn+Enter:send  `=Esc", bodyLen, maxBody);
+        drawFooter(footerBuf);
         dirty = false;
     }
 
