@@ -6,6 +6,7 @@
 #include <microStore/Adapters/NoopFileSystem.h>
 #include <MsgPack.h>
 #include <CardputerUDPInterface.h>
+#include <memory>
 
 // Additional key constants (Cardputer lacks dedicated arrow keys)
 #define KEY_UP     0x52
@@ -44,7 +45,8 @@ struct Message {
 // Contact record
 struct Contact {
     char name[32];
-    char hash[128];  // Reticulum truncated hex hash
+    char hash[128];  // Reticulum truncated hex hash (display)
+    RNS::Bytes fullHash; // Full 32-byte identity hash for Identity::recall()
 };
 
 // Forward declare custom announce handler
@@ -78,8 +80,13 @@ private:
     void sendNativeMessage(const char* recipient_hex, const char* body);
     void doSendNativeMessage(const RNS::Bytes& hash, const char* body);
     
+    // ---- Async WiFi ----
+    void checkWiFiConnection();
+    
     // ---- State Machine ----
     AppState state;
+    AppState lastState;
+    bool stateChanged;  // true on transition
     void runSplash();
     void runHome();
     void runInbox();
@@ -126,6 +133,16 @@ private:
     char displayName[32];
     bool transportEnabled;
     
+    // ---- UI State (replaces static locals) ----
+    int homeSelected = 0;
+    int settingsSel = 0;
+    bool settingsEditing = false;
+    char* settingsEditTarget = nullptr;
+    size_t settingsEditMax = 0;
+    
+    // ---- Message ID counter ----
+    uint32_t nextMsgId = 1;
+    
     // ---- Timing ----
     unsigned long lastBlink;
     bool cursorVisible;
@@ -139,6 +156,9 @@ private:
     bool pendingSendActive;
     unsigned long pendingSendStart;
     
+    // ---- Async WiFi ----
+    unsigned long wifiConnectStart = 0;
+    
     // Reticulum objects
     RNS::Reticulum reticulum;
     RNS::Identity identity;
@@ -147,7 +167,7 @@ private:
     
     // UDP interface wrapper + impl pointer (for credential setup)
     RNS::Interface udpInterface{RNS::Type::NONE};
-    CardputerUDPInterface* udpImpl;
+    std::unique_ptr<CardputerUDPInterface> udpImpl;
     
     // ---- Status info ----
     bool wifiConnected;

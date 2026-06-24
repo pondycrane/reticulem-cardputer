@@ -133,8 +133,9 @@ class ReticuleMBridge:
             "title": title,
             "time": int(time.time() * 1000),
         }
+        # Use the async variant with drain() for backpressure handling
         asyncio.get_event_loop().call_soon_threadsafe(
-            self._send_frame_to_device, frame
+            lambda: asyncio.create_task(self._send_frame_to_device_async(frame))
         )
 
     # ------------------------------------------------------------------
@@ -207,15 +208,25 @@ class ReticuleMBridge:
             logger.info(f"TCP client disconnected: {peer}")
 
     def _send_frame_to_device(self, frame: dict):
-        """Queue a JSON frame to the Cardputer."""
+        """Queue a JSON frame to the Cardputer (fire-and-forget variant for sync callers)."""
         payload = json.dumps(frame, separators=(",", ":")) + "\n"
         data = payload.encode("utf-8")
         if self.serial_writer:
             try:
                 self.serial_writer.write(data)
-                # Note: do not await drain here; this may be called from sync context
             except Exception as e:
                 logger.warning(f"Write to device failed: {e}")
+
+    async def _send_frame_to_device_async(self, frame: dict):
+        """Send a JSON frame with backpressure-aware drain (for async contexts)."""
+        payload = json.dumps(frame, separators=(",", ":")) + "\n"
+        data = payload.encode("utf-8")
+        if self.serial_writer:
+            try:
+                self.serial_writer.write(data)
+                await self.serial_writer.drain()
+            except Exception as e:
+                logger.warning(f"Async write to device failed: {e}")
 
     # ------------------------------------------------------------------
     # Protocol handlers

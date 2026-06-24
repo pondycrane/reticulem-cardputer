@@ -176,9 +176,20 @@ bool CardputerUDPInterface::send_outgoing(const Bytes& data) {
     try {
         if (_online) {
 #ifdef ARDUINO
-            udp.beginPacket(_remote_host.c_str(), _remote_port);
-            udp.write(data.data(), data.size());
-            udp.endPacket();
+            if (!udp.beginPacket(_remote_host.c_str(), _remote_port)) {
+                WARNING("CardputerUDPInterface: beginPacket failed");
+                return false;
+            }
+            size_t written = udp.write(data.data(), data.size());
+            if (written != data.size()) {
+                WARNINGF("CardputerUDPInterface: only wrote %u/%lu bytes", written, (unsigned long)data.size());
+                udp.endPacket();
+                return false;
+            }
+            if (udp.endPacket() == 0) {
+                WARNING("CardputerUDPInterface: endPacket failed (0 bytes sent)");
+                return false;
+            }
 #else
             sockaddr_in sock_addr;
             sock_addr.sin_family = AF_INET;

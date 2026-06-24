@@ -27,9 +27,7 @@ public:
 
 #ifdef ARDUINO
 extern "C" int _write(int file, char *ptr, int len) {
-    int wrote = Serial.write(ptr, len);
-    Serial.flush();
-    return wrote;
+    return Serial.write(ptr, len);
 }
 #endif
 
@@ -38,6 +36,8 @@ extern "C" int _write(int file, char *ptr, int len) {
 // ------------------------------------------------------------------
 ReticuleM::ReticuleM()
     : state(AppState::SPLASH),
+      lastState(AppState::SPLASH),
+      stateChanged(true),
       udpInterface(nullptr),
       keyPressed(false),
       lastChar(0),
@@ -57,7 +57,13 @@ ReticuleM::ReticuleM()
       pendingSendActive(false),
       pendingSendStart(0),
       wifiConnected(false),
-      peerCount(0)
+      peerCount(0),
+      nextMsgId(1),
+      homeSelected(0),
+      settingsSel(0),
+      settingsEditing(false),
+      settingsEditTarget(nullptr),
+      settingsEditMax(0)
 {
     memset(composeTo, 0, sizeof(composeTo));
     memset(composeBody, 0, sizeof(composeBody));
@@ -69,26 +75,30 @@ ReticuleM::ReticuleM()
     memset(pendingSendTo, 0, sizeof(pendingSendTo));
     memset(pendingSendBody, 0, sizeof(pendingSendBody));
     
+    // Defaults — overridden by SPIFFS settings if available
     strncpy(displayName, "Cardputer", sizeof(displayName)-1);
-    strncpy(ssid, "HankerPi", sizeof(ssid)-1);
-    strncpy(password, "27982223", sizeof(password)-1);
+    // WiFi credentials are loaded from /settings.json on SPIFFS.
+    // Set to empty to avoid hardcoding secrets in source; first-boot
+    // user must configure via the Settings screen.
+    ssid[0] = '\0';
+    password[0] = '\0';
     transportEnabled = false;
     
     g_app = this;
 }
 
 void ReticuleM::begin() {
-    initDisplay();
-    initFS();
-    initWiFi();
-    initReticulum();
-    
     Serial.begin(115200);
     delay(100);
     Serial.println("ReticuleM boot with microReticulum");
     
-    splashStart = millis();
+    initDisplay();
     renderSplash();
+    initFS();
+    initReticulum();
+    initWiFi();  // non-blocking — see update()
+    
+    splashStart = millis();
 }
 
 // ------------------------------------------------------------------
@@ -104,16 +114,17 @@ void ReticuleM::update() {
         cursorVisible = !cursorVisible;
     }
 
+    checkWiFiConnection();
+    
     if (millis() - lastStatusUpdate > 2000) {
         lastStatusUpdate = millis();
-        if (WiFi.status() == WL_CONNECTED) {
-            wifiConnected = true;
-        } else {
-            wifiConnected = false;
-        }
+        wifiConnected = (WiFi.status() == WL_CONNECTED);
         drawStatusBar();
     }
 
+    stateChanged = (state != lastState);
+    lastState = state;
+    
     switch (state) {
         case AppState::SPLASH:    runSplash(); break;
         case AppState::HOME:      runHome(); break;
@@ -158,21 +169,23 @@ void ReticuleM::initFS() {
 void ReticuleM::initWiFi() {
     if (strlen(ssid) == 0) return;
     WiFi.begin(ssid, password);
-    Serial.print("Connecting to WiFi");
-    int retries = 40;
-    while (WiFi.status() != WL_CONNECTED && retries-- > 0) {
-        delay(500);
-        Serial.print(".");
-        // Keep pumping display
-        M5Cardputer.update();
-    }
-    Serial.println("");
+    wifiConnectStart = millis();
+    Serial.print("Connecting to WiFi (async)...");
+}
+
+void ReticuleM::checkWiFiConnection() {
+    if (wifiConnected || wifiConnectStart == 0) return;
+    
     if (WiFi.status() == WL_CONNECTED) {
         wifiConnected = true;
+        wifiConnectStart = 0;
+        Serial.println("");
         Serial.print("WiFi IP: ");
         Serial.println(WiFi.localIP());
-    } else {
-        Serial.println("WiFi connection failed");
+    } else if (millis() - wifiConnectStart > 20000) {
+        Serial.println("");
+        Serial.println("WiFi connection failed (timeout)");
+        wifiConnectStart = 0;
     }
 }
 
@@ -189,10 +202,10 @@ void ReticuleM::initReticulum() {
         RNS::Utilities::OS::register_filesystem(fs);
         
         // UDP Interface
-        udpImpl = new CardputerUDPInterface("udp0");
+        udpImpl = std::make_unique<CardputerUDPInterface>("udp0");
         udpImpl->setWiFiCredentials(ssid, password);
         udpImpl->setRemoteHost("255.255.255.255", 4242);
-        udpInterface = RNS::Interface(udpImpl);
+        udpInterface = RNS::Interface(udpImpl.get());
         udpInterface.mode(RNS::Type::Interface::MODE_GATEWAY);
         RNS::Transport::register_interface(udpInterface);
         udpInterface.start();
@@ -261,13 +274,19 @@ void ReticuleM::loadIdentity() {
         String hex = f.readStringUntil('\n');
         hex.trim();
         f.close();
-        if (hex.length() >= 64) {
+        // Ed25519 private key is 32 bytes (64 hex chars)
+        constexpr size_t KEY_HEX_LEN = 64;
+        if (hex.length() >= KEY_HEX_LEN) {
             RNS::Bytes prv;
             prv.assignHex(hex.c_str());
-            identity = RNS::Identity(false);
-            identity.load_private_key(prv);
-            INFO("Loaded existing identity");
-            return;
+            if (prv.size() == KEY_HEX_LEN / 2) {
+                identity = RNS::Identity(false);
+                identity.load_private_key(prv);
+                INFO("Loaded existing identity");
+                return;
+            } else {
+                WARNING("Saved identity key invalid, generating new");
+            }
         }
     }
     // Generate new
@@ -302,10 +321,16 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
     String json = data.toString().c_str();
     StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, json);
-    if (err) {
-        INFOF("Bad JSON payload: %s", err.c_str());
+    // Rate-limit bad packet logging to avoid log spam and CPU waste
+    static int badPacketCount = 0;
+    if (err || !doc["b"].is<const char*>()) {
+        if (badPacketCount < 10) {
+            INFOF("Bad JSON payload: %s", err ? err.c_str() : "missing body");
+        }
+        badPacketCount++;
         return;
     }
+    badPacketCount = 0;
     
     const char* from = doc["f"] | "unknown";
     const char* name = doc["n"] | "";
@@ -314,7 +339,7 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
     // Add to inbox
     if (messageCount < MAX_MESSAGES) {
         Message m{};
-        m.id = millis() + random(1000);
+        m.id = nextMsgId++;
         m.timestamp = millis();
         strlcpy(m.sender, from, sizeof(m.sender));
         strlcpy(m.recipient, ownHash, sizeof(m.recipient));
@@ -350,12 +375,15 @@ void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
                                    const RNS::Bytes& app_data) {
     const char* name = app_data.toString().c_str();
     const char* hash = destination_hash.toHex().c_str();
+    // Store the full 32-byte identity hash for Identity::recall()
+    RNS::Bytes fullIdHash = announced_identity.hash();
     if (strlen(name) == 0 || strcmp(hash, ownHash) == 0) return;
     
     bool found = false;
     for (int i = 0; i < contactCount; i++) {
         if (strcmp(contacts[i].hash, hash) == 0) {
             strlcpy(contacts[i].name, name, sizeof(contacts[i].name));
+            contacts[i].fullHash = fullIdHash;
             found = true;
             break;
         }
@@ -364,6 +392,7 @@ void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
         Contact c{};
         strlcpy(c.name, name, sizeof(c.name));
         strlcpy(c.hash, hash, sizeof(c.hash));
+        c.fullHash = fullIdHash;
         contacts[contactCount++] = c;
         INFOF("New contact: %s (%s)", name, hash);
     }
@@ -373,14 +402,16 @@ void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
 // Message Sending
 // ------------------------------------------------------------------
 void ReticuleM::sendNativeMessage(const char* recipient_hex, const char* body) {
-    // Sanitize hex
+    // Sanitize hex — strip angle brackets safely
+    const char* start = recipient_hex;
+    const char* end = recipient_hex + strlen(recipient_hex);
+    if (*start == '<') start++;
+    if (end > start && *(end-1) == '>') end--;
+    size_t len = end - start;
     char hex_clean[128];
-    strlcpy(hex_clean, recipient_hex, sizeof(hex_clean));
-    // Strip angle brackets if present
-    if (hex_clean[0] == '<') {
-        memmove(hex_clean, hex_clean+1, strlen(hex_clean));
-        if (hex_clean[strlen(hex_clean)-1] == '>') hex_clean[strlen(hex_clean)-1] = '\0';
-    }
+    size_t copyLen = (len < sizeof(hex_clean) - 1) ? len : sizeof(hex_clean) - 1;
+    memcpy(hex_clean, start, copyLen);
+    hex_clean[copyLen] = '\0';
     
     RNS::Bytes hash;
     try {
@@ -393,7 +424,7 @@ void ReticuleM::sendNativeMessage(const char* recipient_hex, const char* body) {
     // Add to local sent box
     if (messageCount < MAX_MESSAGES) {
         Message m{};
-        m.id = millis() + random(1000);
+        m.id = nextMsgId++;
         m.timestamp = millis();
         strlcpy(m.sender, ownHash, sizeof(m.sender));
         strlcpy(m.recipient, hex_clean, sizeof(m.recipient));
@@ -418,7 +449,19 @@ void ReticuleM::sendNativeMessage(const char* recipient_hex, const char* body) {
 }
 
 void ReticuleM::doSendNativeMessage(const RNS::Bytes& hash, const char* body) {
-    RNS::Identity recipient_identity = RNS::Identity::recall(hash);
+    // Look up the full identity hash from contacts (truncated hash won't work for recall)
+    RNS::Bytes recallHash = hash;
+    std::string hexHash = hash.toHex();
+    for (int i = 0; i < contactCount; i++) {
+        if (hexHash == std::string(contacts[i].hash)) {
+            if (contacts[i].fullHash.size() > 0) {
+                recallHash = contacts[i].fullHash;
+            }
+            break;
+        }
+    }
+    
+    RNS::Identity recipient_identity = RNS::Identity::recall(recallHash);
     if (!recipient_identity) {
         strncpy(nodeStatus, "Identity recall failed", sizeof(nodeStatus));
         WARNING("Could not recall identity for destination");
@@ -503,7 +546,6 @@ void ReticuleM::runSplash() {
 // Home
 // ------------------------------------------------------------------
 void ReticuleM::runHome() {
-    static int selected = 0;
     static bool dirty = true;
     const char* items[] = {"Inbox", "Compose", "Contacts", "Settings", "Status"};
     const int count = 5;
@@ -511,30 +553,29 @@ void ReticuleM::runHome() {
     if (dirty) {
         clearScreen();
         drawHeader("ReticuleM");
-        drawMenu(items, count, selected);
-        drawFooter("\u2191\u2193\u2190\u2192:nav  Enter:open  Fn+C:compose");
+        drawMenu(items, count, homeSelected);
+        drawFooter("^v:nav  Enter:open  Fn+C:compose");
         dirty = false;
     }
 
     if (keyPressed) {
         if (lastChar == '2' || lastChar == KEY_DOWN) {
-            selected = (selected + 1) % count;
+            homeSelected = (homeSelected + 1) % count;
             dirty = true;
         } else if (lastChar == '8' || lastChar == KEY_UP) {
-            selected = (selected - 1 + count) % count;
+            homeSelected = (homeSelected - 1 + count) % count;
             dirty = true;
         } else if (lastChar == KEY_ENTER) {
-            switch (selected) {
-                case 0: state = AppState::INBOX; messageSelected = 0; break;
+            switch (homeSelected) {
+                case 0: state = AppState::INBOX; messageSelected = 0; dirty = true; break;
                 case 1: state = AppState::COMPOSE; composeField = 0;
                         memset(composeTo, 0, sizeof(composeTo));
                         memset(composeBody, 0, sizeof(composeBody));
-                        break;
-                case 2: state = AppState::CONTACTS; contactSelected = 0; break;
-                case 3: state = AppState::SETTINGS; break;
-                case 4: state = AppState::STATUS; break;
+                        dirty = true; break;
+                case 2: state = AppState::CONTACTS; contactSelected = 0; dirty = true; break;
+                case 3: state = AppState::SETTINGS; dirty = true; break;
+                case 4: state = AppState::STATUS; dirty = true; break;
             }
-            dirty = true;
             return;
         } else if (fnDown && lastChar == 'c') {
             state = AppState::COMPOSE;
@@ -551,7 +592,7 @@ void ReticuleM::runHome() {
 // Inbox
 // ------------------------------------------------------------------
 void ReticuleM::runInbox() {
-    static bool dirty = true;
+    bool dirty = stateChanged;
 
     if (dirty) {
         clearScreen();
@@ -618,7 +659,7 @@ void ReticuleM::runInbox() {
 // Compose
 // ------------------------------------------------------------------
 void ReticuleM::runCompose() {
-    static bool dirty = true;
+    bool dirty = stateChanged;
 
     if (dirty) {
         clearScreen();
@@ -698,7 +739,7 @@ void ReticuleM::runCompose() {
 // Contacts
 // ------------------------------------------------------------------
 void ReticuleM::runContacts() {
-    static bool dirty = true;
+    bool dirty = stateChanged;
 
     if (dirty) {
         clearScreen();
@@ -721,8 +762,9 @@ void ReticuleM::runContacts() {
                 }
                 M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
                 M5Cardputer.Display.setTextDatum(top_left);
-                String label = String(contacts[i].name) + " " + String(contacts[i].hash).substring(0, 12) + "...";
-                M5Cardputer.Display.drawString(label, 2, y);
+                char lineBuf[48];
+                snprintf(lineBuf, sizeof(lineBuf), "%s %.12s...", contacts[i].name, contacts[i].hash);
+                M5Cardputer.Display.drawString(lineBuf, 2, y);
             }
         }
         drawFooter("\u2191\u2193:scroll  Enter:use  `=Esc");
@@ -754,11 +796,7 @@ void ReticuleM::runContacts() {
 // Settings
 // ------------------------------------------------------------------
 void ReticuleM::runSettings() {
-    static bool dirty = true;
-    static int sel = 0;
-    static bool editing = false;
-    static char* editTarget = nullptr;
-    static size_t editMax = 0;
+    bool dirty = stateChanged;
     const char* labels[] = {"WiFi SSID", "WiFi Pass", "Display Name", "Transport Node", "Save"};
     const int scount = 5;
 
@@ -770,8 +808,8 @@ void ReticuleM::runSettings() {
 
         for (int i = 0; i < scount; i++) {
             int y = 16 + i * 14;
-            bool active = (i == sel);
-            if (active && editing) {
+            bool active = (i == settingsSel);
+            if (active && settingsEditing) {
                 M5Cardputer.Display.fillRect(0, y, SCREEN_W, 14, TFT_DARKGREEN);
                 M5Cardputer.Display.setTextColor(TFT_BLACK);
             } else if (active) {
@@ -789,11 +827,11 @@ void ReticuleM::runSettings() {
                 case 3: val = transportEnabled ? "Yes" : "No"; break;
                 case 4: val = "Write to flash"; break;
             }
-            String line = String(labels[i]) + ": " + val + ((active && editing && cursorVisible) ? "_" : "");
+            String line = String(labels[i]) + ": " + val + ((active && settingsEditing && cursorVisible) ? "_" : "");
             M5Cardputer.Display.drawString(line, 2, y);
         }
 
-        if (!editing) drawFooter("\u2191\u2193:scroll  Enter:edit  `=Esc");
+        if (!settingsEditing) drawFooter("^v:scroll  Enter:edit  `=Esc");
         else drawFooter("Enter:done  Del:clr");
         dirty = false;
     }
@@ -805,19 +843,19 @@ void ReticuleM::runSettings() {
             return;
         }
 
-        if (!editing) {
+        if (!settingsEditing) {
             if (lastChar == '2' || lastChar == KEY_DOWN) {
-                sel = (sel + 1) % scount;
+                settingsSel = (settingsSel + 1) % scount;
                 dirty = true;
             } else if (lastChar == '8' || lastChar == KEY_UP) {
-                sel = (sel - 1 + scount) % scount;
+                settingsSel = (settingsSel - 1 + scount) % scount;
                 dirty = true;
             } else if (lastChar == KEY_ENTER) {
-                if (sel == 3) {
+                if (settingsSel == 3) {
                     transportEnabled = !transportEnabled;
                     reticulum.transport_enabled(transportEnabled);
                     dirty = true;
-                } else if (sel == 4) {
+                } else if (settingsSel == 4) {
                     // Save to /settings.json
                     StaticJsonDocument<512> doc;
                     doc["ssid"] = ssid;
@@ -831,30 +869,30 @@ void ReticuleM::runSettings() {
                     }
                     dirty = true;
                 } else {
-                    editing = true;
-                    switch (sel) {
-                        case 0: editTarget = ssid; editMax = sizeof(ssid) - 1; break;
-                        case 1: editTarget = password; editMax = sizeof(password) - 1; break;
-                        case 2: editTarget = displayName; editMax = sizeof(displayName) - 1; break;
+                    settingsEditing = true;
+                    switch (settingsSel) {
+                        case 0: settingsEditTarget = ssid; settingsEditMax = sizeof(ssid) - 1; break;
+                        case 1: settingsEditTarget = password; settingsEditMax = sizeof(password) - 1; break;
+                        case 2: settingsEditTarget = displayName; settingsEditMax = sizeof(displayName) - 1; break;
                     }
                 }
                 dirty = true;
             }
         } else {
             if (lastChar == KEY_ENTER) {
-                editing = false;
-                editTarget = nullptr;
+                settingsEditing = false;
+                settingsEditTarget = nullptr;
                 dirty = true;
             } else if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
-                if (editTarget && strlen(editTarget) > 0) {
-                    editTarget[strlen(editTarget) - 1] = '\0';
+                if (settingsEditTarget && strlen(settingsEditTarget) > 0) {
+                    settingsEditTarget[strlen(settingsEditTarget) - 1] = '\0';
                     dirty = true;
                 }
-            } else if (lastChar >= 32 && lastChar < 127 && editTarget) {
-                if (strlen(editTarget) < editMax) {
-                    size_t len = strlen(editTarget);
-                    editTarget[len] = lastChar;
-                    editTarget[len + 1] = '\0';
+            } else if (lastChar >= 32 && lastChar < 127 && settingsEditTarget) {
+                if (strlen(settingsEditTarget) < settingsEditMax) {
+                    size_t len = strlen(settingsEditTarget);
+                    settingsEditTarget[len] = lastChar;
+                    settingsEditTarget[len + 1] = '\0';
                     dirty = true;
                 }
             }
@@ -866,7 +904,7 @@ void ReticuleM::runSettings() {
 // Status
 // ------------------------------------------------------------------
 void ReticuleM::runStatus() {
-    static bool dirty = true;
+    bool dirty = stateChanged;
     if (dirty) {
         clearScreen();
         drawHeader("Status");
@@ -874,18 +912,29 @@ void ReticuleM::runStatus() {
         M5Cardputer.Display.setTextDatum(top_left);
         M5Cardputer.Display.setTextColor(TFT_WHITE);
         int y = 16;
+        char lineBuf[64];
         
-        M5Cardputer.Display.drawString("WiFi:  " + String(wifiConnected ? WiFi.localIP().toString() : "Disconnected"), 2, y);
+        if (wifiConnected) {
+            snprintf(lineBuf, sizeof(lineBuf), "WiFi:  %s", WiFi.localIP().toString().c_str());
+        } else {
+            snprintf(lineBuf, sizeof(lineBuf), "WiFi:  Disconnected");
+        }
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        M5Cardputer.Display.drawString("Hash:  " + String(ownHash).substring(0, 28), 2, y);
+        snprintf(lineBuf, sizeof(lineBuf), "Hash:  %.28s", ownHash);
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        M5Cardputer.Display.drawString("Msgs:  " + String(messageCount) + "/" + String(MAX_MESSAGES), 2, y);
+        snprintf(lineBuf, sizeof(lineBuf), "Msgs:  %d/%d", messageCount, MAX_MESSAGES);
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        M5Cardputer.Display.drawString("Contacts:" + String(contactCount), 2, y);
+        snprintf(lineBuf, sizeof(lineBuf), "Contacts: %d", contactCount);
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        M5Cardputer.Display.drawString("Status:" + String(nodeStatus), 2, y);
+        snprintf(lineBuf, sizeof(lineBuf), "Status: %s", nodeStatus);
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        M5Cardputer.Display.drawString("Name:  " + String(displayName), 2, y);
+        snprintf(lineBuf, sizeof(lineBuf), "Name:  %s", displayName);
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
         
         drawFooter("`=Esc");
         dirty = false;
@@ -1025,8 +1074,9 @@ void ReticuleM::drawMessageList() {
         }
         M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
         M5Cardputer.Display.setTextDatum(top_left);
-        String prefix = m.outgoing ? "\u2191 " : (m.read ? "  " : "\u25cf ");
-        String line = prefix + String(m.sender).substring(0, 10) + ": " + String(m.content).substring(0, 24);
-        M5Cardputer.Display.drawString(line, 2, y);
+        char lineBuf[48];
+        const char* prefix = m.outgoing ? ">" : (m.read ? " " : "*");
+        snprintf(lineBuf, sizeof(lineBuf), "%s %.10s: %.24s", prefix, m.sender, m.content);
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
     }
 }
