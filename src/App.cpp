@@ -1,0 +1,1032 @@
+#include "App.h"
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+
+// ------------------------------------------------------------------
+// Global app pointer for C-style callbacks
+// ------------------------------------------------------------------
+static ReticuleM* g_app = nullptr;
+
+static void staticPacketCallback(const RNS::Bytes& data, const RNS::Packet& packet) {
+    if (g_app) g_app->onPacketReceived(data, packet);
+}
+
+// ------------------------------------------------------------------
+// ReticuleM Announce Handler subclass
+// ------------------------------------------------------------------
+class ReticuleMAnnounceHandler : public RNS::AnnounceHandler {
+public:
+    ReticuleM* app;
+    ReticuleMAnnounceHandler(ReticuleM* a) : RNS::AnnounceHandler("reticulem.inbox"), app(a) {}
+    virtual void received_announce(const RNS::Bytes& destination_hash,
+                                   const RNS::Identity& announced_identity,
+                                   const RNS::Bytes& app_data) override {
+        if (app) app->onAnnounceReceived(destination_hash, announced_identity, app_data);
+    }
+};
+
+#ifdef ARDUINO
+extern "C" int _write(int file, char *ptr, int len) {
+    int wrote = Serial.write(ptr, len);
+    Serial.flush();
+    return wrote;
+}
+#endif
+
+// ------------------------------------------------------------------
+// Lifecycle
+// ------------------------------------------------------------------
+ReticuleM::ReticuleM()
+    : state(AppState::SPLASH),
+      udpInterface(nullptr),
+      keyPressed(false),
+      lastChar(0),
+      fnDown(false),
+      ctrlDown(false),
+      cursorPos(0),
+      messageCount(0),
+      messageSelected(0),
+      contactCount(0),
+      contactSelected(0),
+      composeField(0),
+      lastBlink(0),
+      cursorVisible(true),
+      splashStart(0),
+      lastAnnounce(0),
+      lastStatusUpdate(0),
+      pendingSendActive(false),
+      pendingSendStart(0),
+      wifiConnected(false),
+      peerCount(0)
+{
+    memset(composeTo, 0, sizeof(composeTo));
+    memset(composeBody, 0, sizeof(composeBody));
+    memset(ssid, 0, sizeof(ssid));
+    memset(password, 0, sizeof(password));
+    memset(displayName, 0, sizeof(displayName));
+    memset(ownHash, 0, sizeof(ownHash));
+    memset(nodeStatus, 0, sizeof(nodeStatus));
+    memset(pendingSendTo, 0, sizeof(pendingSendTo));
+    memset(pendingSendBody, 0, sizeof(pendingSendBody));
+    
+    strncpy(displayName, "Cardputer", sizeof(displayName)-1);
+    strncpy(ssid, "HankerPi", sizeof(ssid)-1);
+    strncpy(password, "27982223", sizeof(password)-1);
+    transportEnabled = false;
+    
+    g_app = this;
+}
+
+void ReticuleM::begin() {
+    initDisplay();
+    initFS();
+    initWiFi();
+    initReticulum();
+    
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("ReticuleM boot with microReticulum");
+    
+    splashStart = millis();
+    renderSplash();
+}
+
+// ------------------------------------------------------------------
+// Main Loop
+// ------------------------------------------------------------------
+void ReticuleM::update() {
+    M5Cardputer.update();
+    processKeyboard();
+    reticulumLoop();
+
+    if (millis() - lastBlink > 500) {
+        lastBlink = millis();
+        cursorVisible = !cursorVisible;
+    }
+
+    if (millis() - lastStatusUpdate > 2000) {
+        lastStatusUpdate = millis();
+        if (WiFi.status() == WL_CONNECTED) {
+            wifiConnected = true;
+        } else {
+            wifiConnected = false;
+        }
+        drawStatusBar();
+    }
+
+    switch (state) {
+        case AppState::SPLASH:    runSplash(); break;
+        case AppState::HOME:      runHome(); break;
+        case AppState::INBOX:     runInbox(); break;
+        case AppState::COMPOSE:   runCompose(); break;
+        case AppState::CONTACTS:  runContacts(); break;
+        case AppState::SETTINGS:  runSettings(); break;
+        case AppState::STATUS:    runStatus(); break;
+    }
+}
+
+// ------------------------------------------------------------------
+// Hardware Init
+// ------------------------------------------------------------------
+void ReticuleM::initDisplay() {
+    auto cfg = M5.config();
+    M5Cardputer.begin(cfg, true);
+    M5Cardputer.Display.setRotation(1);
+    M5Cardputer.Display.setBrightness(128);
+    M5Cardputer.Display.fillScreen(TFT_BLACK);
+}
+
+void ReticuleM::initFS() {
+    if (!SPIFFS.begin(true)) {
+        Serial.println("SPIFFS init failed");
+    } else {
+        // Load settings from /settings.json if exists
+        File f = SPIFFS.open("/settings.json", "r");
+        if (f) {
+            StaticJsonDocument<512> doc;
+            deserializeJson(doc, f);
+            strlcpy(ssid, doc["ssid"] | ssid, sizeof(ssid));
+            strlcpy(password, doc["password"] | password, sizeof(password));
+            strlcpy(displayName, doc["name"] | displayName, sizeof(displayName));
+            transportEnabled = doc["transport"] | false;
+            f.close();
+        }
+        Serial.println("SPIFFS ready");
+    }
+}
+
+void ReticuleM::initWiFi() {
+    if (strlen(ssid) == 0) return;
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    int retries = 40;
+    while (WiFi.status() != WL_CONNECTED && retries-- > 0) {
+        delay(500);
+        Serial.print(".");
+        // Keep pumping display
+        M5Cardputer.update();
+    }
+    Serial.println("");
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.print("WiFi IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("WiFi connection failed");
+    }
+}
+
+// ------------------------------------------------------------------
+// Reticulum Stack
+// ------------------------------------------------------------------
+void ReticuleM::initReticulum() {
+    INFO("Init microReticulum...");
+    
+    try {
+        // Register filesystem for RNS persistence
+        microStore::FileSystem fs{microStore::Adapters::NoopFileSystem()};
+        fs.init();
+        RNS::Utilities::OS::register_filesystem(fs);
+        
+        // UDP Interface
+        udpImpl = new CardputerUDPInterface("udp0");
+        udpImpl->setWiFiCredentials(ssid, password);
+        udpImpl->setRemoteHost("255.255.255.255", 4242);
+        udpInterface = RNS::Interface(udpImpl);
+        udpInterface.mode(RNS::Type::Interface::MODE_GATEWAY);
+        RNS::Transport::register_interface(udpInterface);
+        udpInterface.start();
+        
+        // Reticulum instance
+        reticulum = RNS::Reticulum();
+        reticulum.transport_enabled(transportEnabled);
+        reticulum.probe_destination_enabled(true);
+        reticulum.remote_management_enabled(false);
+        reticulum.start();
+        
+        // Identity
+        loadIdentity();
+        strlcpy(ownHash, identity.hash().toHex().c_str(), sizeof(ownHash));
+        INFOF("Identity loaded, hash: %s", ownHash);
+        
+        // Inbox destination
+        inboxDest = RNS::Destination(
+            identity,
+            RNS::Type::Destination::IN,
+            RNS::Type::Destination::SINGLE,
+            "reticulem",
+            "inbox"
+        );
+        inboxDest.set_packet_callback(staticPacketCallback);
+        inboxDest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
+        INFOF("Inbox destination: %s", inboxDest.hash().toHex().c_str());
+        
+        // Announce handler
+        announceHandler = RNS::HAnnounceHandler(new ReticuleMAnnounceHandler(this));
+        RNS::Transport::register_announce_handler(announceHandler);
+        
+        // Initial announce
+        performAnnounce();
+        strncpy(nodeStatus, "Ready", sizeof(nodeStatus));
+    }
+    catch (const std::exception& e) {
+        ERRORF("Reticulum init exception: %s", e.what());
+        strncpy(nodeStatus, "Init error", sizeof(nodeStatus));
+    }
+}
+
+void ReticuleM::reticulumLoop() {
+    try {
+        reticulum.loop();
+        
+        // Periodic announce every 60 seconds
+        if (millis() - lastAnnounce > 60000) {
+            performAnnounce();
+            lastAnnounce = millis();
+        }
+        
+        // Flush pending sends
+        if (pendingSendActive) {
+            flushPendingSend();
+        }
+    }
+    catch (const std::exception& e) {
+        ERRORF("Reticulum loop exception: %s", e.what());
+    }
+}
+
+void ReticuleM::loadIdentity() {
+    File f = SPIFFS.open("/identity.txt", "r");
+    if (f) {
+        String hex = f.readStringUntil('\n');
+        hex.trim();
+        f.close();
+        if (hex.length() >= 64) {
+            RNS::Bytes prv;
+            prv.assignHex(hex.c_str());
+            identity = RNS::Identity(false);
+            identity.load_private_key(prv);
+            INFO("Loaded existing identity");
+            return;
+        }
+    }
+    // Generate new
+    identity = RNS::Identity();
+    saveIdentity();
+    INFO("Generated new identity");
+}
+
+void ReticuleM::saveIdentity() {
+    RNS::Bytes prv = identity.get_private_key();
+    File f = SPIFFS.open("/identity.txt", "w");
+    if (f) {
+        f.print(prv.toHex().c_str());
+        f.println();
+        f.close();
+    }
+}
+
+void ReticuleM::performAnnounce() {
+    if (inboxDest) {
+        RNS::Bytes app_data(displayName);
+        inboxDest.announce(app_data);
+        INFO("Announced reticulem.inbox");
+    }
+}
+
+// ------------------------------------------------------------------
+// Message Receiving
+// ------------------------------------------------------------------
+void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& packet) {
+    // Parse JSON payload
+    String json = data.toString().c_str();
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, json);
+    if (err) {
+        INFOF("Bad JSON payload: %s", err.c_str());
+        return;
+    }
+    
+    const char* from = doc["f"] | "unknown";
+    const char* name = doc["n"] | "";
+    const char* body = doc["b"] | "";
+    
+    // Add to inbox
+    if (messageCount < MAX_MESSAGES) {
+        Message m{};
+        m.id = millis() + random(1000);
+        m.timestamp = millis();
+        strlcpy(m.sender, from, sizeof(m.sender));
+        strlcpy(m.recipient, ownHash, sizeof(m.recipient));
+        strlcpy(m.content, body, sizeof(m.content));
+        m.outgoing = false;
+        m.read = false;
+        messages[messageCount++] = m;
+    }
+    
+    // Auto-add/update contact
+    if (strlen(name) > 0) {
+        bool found = false;
+        for (int i = 0; i < contactCount; i++) {
+            if (strcmp(contacts[i].hash, from) == 0) {
+                strlcpy(contacts[i].name, name, sizeof(contacts[i].name));
+                found = true;
+                break;
+            }
+        }
+        if (!found && contactCount < MAX_CONTACTS) {
+            Contact c{};
+            strlcpy(c.name, name, sizeof(c.name));
+            strlcpy(c.hash, from, sizeof(c.hash));
+            contacts[contactCount++] = c;
+        }
+    }
+    
+    INFOF("Received msg from %s", from);
+}
+
+void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
+                                   const RNS::Identity& announced_identity,
+                                   const RNS::Bytes& app_data) {
+    const char* name = app_data.toString().c_str();
+    const char* hash = destination_hash.toHex().c_str();
+    if (strlen(name) == 0 || strcmp(hash, ownHash) == 0) return;
+    
+    bool found = false;
+    for (int i = 0; i < contactCount; i++) {
+        if (strcmp(contacts[i].hash, hash) == 0) {
+            strlcpy(contacts[i].name, name, sizeof(contacts[i].name));
+            found = true;
+            break;
+        }
+    }
+    if (!found && contactCount < MAX_CONTACTS) {
+        Contact c{};
+        strlcpy(c.name, name, sizeof(c.name));
+        strlcpy(c.hash, hash, sizeof(c.hash));
+        contacts[contactCount++] = c;
+        INFOF("New contact: %s (%s)", name, hash);
+    }
+}
+
+// ------------------------------------------------------------------
+// Message Sending
+// ------------------------------------------------------------------
+void ReticuleM::sendNativeMessage(const char* recipient_hex, const char* body) {
+    // Sanitize hex
+    char hex_clean[128];
+    strlcpy(hex_clean, recipient_hex, sizeof(hex_clean));
+    // Strip angle brackets if present
+    if (hex_clean[0] == '<') {
+        memmove(hex_clean, hex_clean+1, strlen(hex_clean));
+        if (hex_clean[strlen(hex_clean)-1] == '>') hex_clean[strlen(hex_clean)-1] = '\0';
+    }
+    
+    RNS::Bytes hash;
+    try {
+        hash.assignHex(hex_clean);
+    } catch (...) {
+        strncpy(nodeStatus, "Bad hash", sizeof(nodeStatus));
+        return;
+    }
+    
+    // Add to local sent box
+    if (messageCount < MAX_MESSAGES) {
+        Message m{};
+        m.id = millis() + random(1000);
+        m.timestamp = millis();
+        strlcpy(m.sender, ownHash, sizeof(m.sender));
+        strlcpy(m.recipient, hex_clean, sizeof(m.recipient));
+        strlcpy(m.content, body, sizeof(m.content));
+        m.outgoing = true;
+        m.read = true;
+        messages[messageCount++] = m;
+    }
+    
+    if (!RNS::Transport::has_path(hash)) {
+        RNS::Transport::request_path(hash);
+        strlcpy(pendingSendTo, hex_clean, sizeof(pendingSendTo));
+        strlcpy(pendingSendBody, body, sizeof(pendingSendBody));
+        pendingSendActive = true;
+        pendingSendStart = millis();
+        strncpy(nodeStatus, "Finding path...", sizeof(nodeStatus));
+        INFO("Path discovery started for message");
+        return;
+    }
+    
+    doSendNativeMessage(hash, body);
+}
+
+void ReticuleM::doSendNativeMessage(const RNS::Bytes& hash, const char* body) {
+    RNS::Identity recipient_identity = RNS::Identity::recall(hash);
+    if (!recipient_identity) {
+        strncpy(nodeStatus, "Identity recall failed", sizeof(nodeStatus));
+        WARNING("Could not recall identity for destination");
+        return;
+    }
+    
+    RNS::Destination recipient(
+        recipient_identity,
+        RNS::Type::Destination::OUT,
+        RNS::Type::Destination::SINGLE,
+        "reticulem",
+        "inbox"
+    );
+    
+    StaticJsonDocument<512> doc;
+    doc["v"] = 1;
+    doc["n"] = displayName;
+    doc["f"] = ownHash;
+    doc["b"] = body;
+    String json;
+    serializeJson(doc, json);
+    
+    RNS::Packet packet(recipient, RNS::Bytes(json.c_str(), json.length()));
+    RNS::PacketReceipt receipt = packet.receipt_send();
+    if (receipt) {
+        strncpy(nodeStatus, "Sent", sizeof(nodeStatus));
+        INFO("Message sent");
+    } else {
+        strncpy(nodeStatus, "Send failed", sizeof(nodeStatus));
+        WARNING("Message send failed");
+    }
+}
+
+void ReticuleM::flushPendingSend() {
+    if (!pendingSendActive) return;
+    
+    RNS::Bytes hash;
+    try {
+        hash.assignHex(pendingSendTo);
+    } catch (...) {
+        pendingSendActive = false;
+        strncpy(nodeStatus, "Bad pending hash", sizeof(nodeStatus));
+        return;
+    }
+    
+    if (RNS::Transport::has_path(hash)) {
+        doSendNativeMessage(hash, pendingSendBody);
+        pendingSendActive = false;
+    } else if (millis() - pendingSendStart > 30000) {
+        pendingSendActive = false;
+        strncpy(nodeStatus, "Path timeout", sizeof(nodeStatus));
+        WARNING("Path discovery timed out for pending message");
+    }
+}
+
+// ------------------------------------------------------------------
+// Splash Screen
+// ------------------------------------------------------------------
+void ReticuleM::renderSplash() {
+    clearScreen(TFT_BLACK);
+    M5Cardputer.Display.setTextColor(TFT_GREEN);
+    M5Cardputer.Display.setTextDatum(middle_center);
+    M5Cardputer.Display.setTextFont(&fonts::FreeMonoBold12pt7b);
+    M5Cardputer.Display.drawString("ReticuleM",
+        SCREEN_W / 2, SCREEN_H / 2 - 20);
+    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setTextColor(TFT_LIGHTGREY);
+    M5Cardputer.Display.drawString("microReticulum",
+        SCREEN_W / 2, SCREEN_H / 2 + 8);
+    M5Cardputer.Display.drawString("v0.2",
+        SCREEN_W / 2, SCREEN_H / 2 + 24);
+}
+
+void ReticuleM::runSplash() {
+    if (millis() - splashStart > 2000) {
+        state = AppState::HOME;
+        clearScreen();
+    }
+}
+
+// ------------------------------------------------------------------
+// Home
+// ------------------------------------------------------------------
+void ReticuleM::runHome() {
+    static int selected = 0;
+    static bool dirty = true;
+    const char* items[] = {"Inbox", "Compose", "Contacts", "Settings", "Status"};
+    const int count = 5;
+
+    if (dirty) {
+        clearScreen();
+        drawHeader("ReticuleM");
+        drawMenu(items, count, selected);
+        drawFooter("\u2191\u2193\u2190\u2192:nav  Enter:open  Fn+C:compose");
+        dirty = false;
+    }
+
+    if (keyPressed) {
+        if (lastChar == '2' || lastChar == KEY_DOWN) {
+            selected = (selected + 1) % count;
+            dirty = true;
+        } else if (lastChar == '8' || lastChar == KEY_UP) {
+            selected = (selected - 1 + count) % count;
+            dirty = true;
+        } else if (lastChar == KEY_ENTER) {
+            switch (selected) {
+                case 0: state = AppState::INBOX; messageSelected = 0; break;
+                case 1: state = AppState::COMPOSE; composeField = 0;
+                        memset(composeTo, 0, sizeof(composeTo));
+                        memset(composeBody, 0, sizeof(composeBody));
+                        break;
+                case 2: state = AppState::CONTACTS; contactSelected = 0; break;
+                case 3: state = AppState::SETTINGS; break;
+                case 4: state = AppState::STATUS; break;
+            }
+            dirty = true;
+            return;
+        } else if (fnDown && lastChar == 'c') {
+            state = AppState::COMPOSE;
+            composeField = 0;
+            memset(composeTo, 0, sizeof(composeTo));
+            memset(composeBody, 0, sizeof(composeBody));
+            dirty = true;
+            return;
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Inbox
+// ------------------------------------------------------------------
+void ReticuleM::runInbox() {
+    static bool dirty = true;
+
+    if (dirty) {
+        clearScreen();
+        drawHeader("Inbox");
+        drawMessageList();
+        drawFooter("\u2191\u2193:scroll  Enter:read  Del:drop  `=Esc");
+        dirty = false;
+    }
+
+    if (keyPressed) {
+        if (lastChar == '2' || lastChar == KEY_DOWN) {
+            if (messageSelected < messageCount - 1) { messageSelected++; dirty = true; }
+        } else if (lastChar == '8' || lastChar == KEY_UP) {
+            if (messageSelected > 0) { messageSelected--; dirty = true; }
+        } else if (lastChar == KEY_ENTER) {
+            if (messageCount > 0 && messageSelected < messageCount) {
+                messages[messageSelected].read = true;
+                clearScreen();
+                drawHeader("Message");
+                M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+                M5Cardputer.Display.setTextDatum(top_left);
+                M5Cardputer.Display.setTextColor(TFT_WHITE);
+                int y = 16;
+                M5Cardputer.Display.drawString(String("From: ") + messages[messageSelected].sender, 2, y);
+                y += 12;
+                M5Cardputer.Display.drawString(String("To: ") + messages[messageSelected].recipient, 2, y);
+                y += 16;
+                String body = messages[messageSelected].content;
+                int lineWidth = (SCREEN_W - 4) / 6;
+                for (int i = 0; i < body.length() && y < SCREEN_H - 16; i += lineWidth) {
+                    int endPos = i + lineWidth;
+                    if (endPos > body.length()) endPos = body.length();
+                    M5Cardputer.Display.drawString(body.substring(i, endPos), 2, y);
+                    y += 12;
+                }
+                drawFooter("Any key to return");
+                // Wait for any key to return
+                dirty = true;
+                keyPressed = false;
+            }
+        } else if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
+            if (messageCount > 0 && messageSelected < messageCount) {
+                for (int i = messageSelected; i < messageCount - 1; i++) {
+                    messages[i] = messages[i + 1];
+                }
+                messageCount--;
+                if (messageSelected >= messageCount && messageSelected > 0) messageSelected--;
+                dirty = true;
+            }
+        } else if (lastChar == KEY_ESC) {
+            state = AppState::HOME;
+            dirty = true;
+            return;
+        } else {
+            // Returning from detail view
+            dirty = true;
+            keyPressed = false;
+            return;
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Compose
+// ------------------------------------------------------------------
+void ReticuleM::runCompose() {
+    static bool dirty = true;
+
+    if (dirty) {
+        clearScreen();
+        drawHeader("Compose");
+        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setTextDatum(top_left);
+
+        int y = 16;
+        M5Cardputer.Display.setTextColor(composeField == 0 ? TFT_CYAN : TFT_DARKGREY);
+        M5Cardputer.Display.drawString("To:", 2, y);
+        M5Cardputer.Display.setTextColor(TFT_WHITE);
+        M5Cardputer.Display.drawString(String(composeTo) + (composeField == 0 && cursorVisible ? "_" : ""), 28, y);
+        y += 14;
+
+        M5Cardputer.Display.setTextColor(composeField == 1 ? TFT_CYAN : TFT_DARKGREY);
+        M5Cardputer.Display.drawString("Msg:", 2, y);
+        M5Cardputer.Display.setTextColor(TFT_WHITE);
+        String bodyPreview = String(composeBody);
+        if (composeField == 1 && cursorVisible) bodyPreview += "_";
+        int lineWidth = (SCREEN_W - 36) / 6;
+        for (int i = 0; i < bodyPreview.length() && y < SCREEN_H - 14; i += lineWidth) {
+            int endPos = i + lineWidth;
+            if (endPos > bodyPreview.length()) endPos = bodyPreview.length();
+            M5Cardputer.Display.drawString(bodyPreview.substring(i, endPos), 36, y);
+            y += 12;
+        }
+
+        drawFooter("Tab:field  Fn+Enter:send  `=Esc");
+        dirty = false;
+    }
+
+    if (keyPressed) {
+        if (lastChar == KEY_ESC) {
+            state = AppState::HOME;
+            dirty = true;
+            return;
+        }
+
+        if (fnDown && lastChar == KEY_ENTER) {
+            if (strlen(composeTo) > 0 && strlen(composeBody) > 0) {
+                sendNativeMessage(composeTo, composeBody);
+            }
+            state = AppState::INBOX;
+            dirty = true;
+            return;
+        }
+
+        if (lastChar == KEY_TAB) {
+            composeField = (composeField + 1) % 2;
+            dirty = true;
+            return;
+        }
+
+        if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
+            if (composeField == 0 && strlen(composeTo) > 0) {
+                composeTo[strlen(composeTo) - 1] = '\0';
+            } else if (composeField == 1 && strlen(composeBody) > 0) {
+                composeBody[strlen(composeBody) - 1] = '\0';
+            }
+            dirty = true;
+        } else if (lastChar >= 32 && lastChar < 127) {
+            if (composeField == 0 && strlen(composeTo) < sizeof(composeTo) - 1) {
+                size_t len = strlen(composeTo);
+                composeTo[len] = lastChar;
+                composeTo[len + 1] = '\0';
+            } else if (composeField == 1 && strlen(composeBody) < sizeof(composeBody) - 1) {
+                size_t len = strlen(composeBody);
+                composeBody[len] = lastChar;
+                composeBody[len + 1] = '\0';
+            }
+            dirty = true;
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Contacts
+// ------------------------------------------------------------------
+void ReticuleM::runContacts() {
+    static bool dirty = true;
+
+    if (dirty) {
+        clearScreen();
+        drawHeader("Contacts");
+        if (contactCount == 0) {
+            M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+            M5Cardputer.Display.setTextDatum(middle_center);
+            M5Cardputer.Display.setTextColor(TFT_DARKGREY);
+            M5Cardputer.Display.drawString("No contacts", SCREEN_W / 2, SCREEN_H / 2);
+        } else {
+            const int lineHeight = 13;
+            int start = max(0, contactSelected - 8);
+            for (int i = start; i < contactCount && (i - start) < 9; i++) {
+                int y = 16 + (i - start) * lineHeight;
+                if (i == contactSelected) {
+                    M5Cardputer.Display.fillRect(0, y, SCREEN_W, lineHeight, TFT_DARKCYAN);
+                    M5Cardputer.Display.setTextColor(TFT_BLACK);
+                } else {
+                    M5Cardputer.Display.setTextColor(TFT_WHITE);
+                }
+                M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+                M5Cardputer.Display.setTextDatum(top_left);
+                String label = String(contacts[i].name) + " " + String(contacts[i].hash).substring(0, 12) + "...";
+                M5Cardputer.Display.drawString(label, 2, y);
+            }
+        }
+        drawFooter("\u2191\u2193:scroll  Enter:use  `=Esc");
+        dirty = false;
+    }
+
+    if (keyPressed) {
+        if (lastChar == KEY_ESC) {
+            state = AppState::HOME;
+            dirty = true;
+            return;
+        }
+        if (lastChar == '2' || lastChar == KEY_DOWN) {
+            if (contactSelected < contactCount - 1) { contactSelected++; dirty = true; }
+        } else if (lastChar == '8' || lastChar == KEY_UP) {
+            if (contactSelected > 0) { contactSelected--; dirty = true; }
+        } else if (lastChar == KEY_ENTER) {
+            if (contactCount > 0 && contactSelected < contactCount) {
+                strncpy(composeTo, contacts[contactSelected].hash, sizeof(composeTo) - 1);
+                state = AppState::COMPOSE;
+                composeField = 1;
+                dirty = true;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Settings
+// ------------------------------------------------------------------
+void ReticuleM::runSettings() {
+    static bool dirty = true;
+    static int sel = 0;
+    static bool editing = false;
+    static char* editTarget = nullptr;
+    static size_t editMax = 0;
+    const char* labels[] = {"WiFi SSID", "WiFi Pass", "Display Name", "Transport Node", "Save"};
+    const int scount = 5;
+
+    if (dirty) {
+        clearScreen();
+        drawHeader("Settings");
+        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setTextDatum(top_left);
+
+        for (int i = 0; i < scount; i++) {
+            int y = 16 + i * 14;
+            bool active = (i == sel);
+            if (active && editing) {
+                M5Cardputer.Display.fillRect(0, y, SCREEN_W, 14, TFT_DARKGREEN);
+                M5Cardputer.Display.setTextColor(TFT_BLACK);
+            } else if (active) {
+                M5Cardputer.Display.fillRect(0, y, SCREEN_W, 14, TFT_DARKGREY);
+                M5Cardputer.Display.setTextColor(TFT_WHITE);
+            } else {
+                M5Cardputer.Display.setTextColor(TFT_LIGHTGREY);
+            }
+
+            const char* val = "";
+            switch (i) {
+                case 0: val = ssid; break;
+                case 1: val = password; break;
+                case 2: val = displayName; break;
+                case 3: val = transportEnabled ? "Yes" : "No"; break;
+                case 4: val = "Write to flash"; break;
+            }
+            String line = String(labels[i]) + ": " + val + ((active && editing && cursorVisible) ? "_" : "");
+            M5Cardputer.Display.drawString(line, 2, y);
+        }
+
+        if (!editing) drawFooter("\u2191\u2193:scroll  Enter:edit  `=Esc");
+        else drawFooter("Enter:done  Del:clr");
+        dirty = false;
+    }
+
+    if (keyPressed) {
+        if (lastChar == KEY_ESC) {
+            state = AppState::HOME;
+            dirty = true;
+            return;
+        }
+
+        if (!editing) {
+            if (lastChar == '2' || lastChar == KEY_DOWN) {
+                sel = (sel + 1) % scount;
+                dirty = true;
+            } else if (lastChar == '8' || lastChar == KEY_UP) {
+                sel = (sel - 1 + scount) % scount;
+                dirty = true;
+            } else if (lastChar == KEY_ENTER) {
+                if (sel == 3) {
+                    transportEnabled = !transportEnabled;
+                    reticulum.transport_enabled(transportEnabled);
+                    dirty = true;
+                } else if (sel == 4) {
+                    // Save to /settings.json
+                    StaticJsonDocument<512> doc;
+                    doc["ssid"] = ssid;
+                    doc["password"] = password;
+                    doc["name"] = displayName;
+                    doc["transport"] = transportEnabled;
+                    File f = SPIFFS.open("/settings.json", "w");
+                    if (f) {
+                        serializeJson(doc, f);
+                        f.close();
+                    }
+                    dirty = true;
+                } else {
+                    editing = true;
+                    switch (sel) {
+                        case 0: editTarget = ssid; editMax = sizeof(ssid) - 1; break;
+                        case 1: editTarget = password; editMax = sizeof(password) - 1; break;
+                        case 2: editTarget = displayName; editMax = sizeof(displayName) - 1; break;
+                    }
+                }
+                dirty = true;
+            }
+        } else {
+            if (lastChar == KEY_ENTER) {
+                editing = false;
+                editTarget = nullptr;
+                dirty = true;
+            } else if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
+                if (editTarget && strlen(editTarget) > 0) {
+                    editTarget[strlen(editTarget) - 1] = '\0';
+                    dirty = true;
+                }
+            } else if (lastChar >= 32 && lastChar < 127 && editTarget) {
+                if (strlen(editTarget) < editMax) {
+                    size_t len = strlen(editTarget);
+                    editTarget[len] = lastChar;
+                    editTarget[len + 1] = '\0';
+                    dirty = true;
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Status
+// ------------------------------------------------------------------
+void ReticuleM::runStatus() {
+    static bool dirty = true;
+    if (dirty) {
+        clearScreen();
+        drawHeader("Status");
+        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setTextDatum(top_left);
+        M5Cardputer.Display.setTextColor(TFT_WHITE);
+        int y = 16;
+        
+        M5Cardputer.Display.drawString("WiFi:  " + String(wifiConnected ? WiFi.localIP().toString() : "Disconnected"), 2, y);
+        y += 14;
+        M5Cardputer.Display.drawString("Hash:  " + String(ownHash).substring(0, 28), 2, y);
+        y += 14;
+        M5Cardputer.Display.drawString("Msgs:  " + String(messageCount) + "/" + String(MAX_MESSAGES), 2, y);
+        y += 14;
+        M5Cardputer.Display.drawString("Contacts:" + String(contactCount), 2, y);
+        y += 14;
+        M5Cardputer.Display.drawString("Status:" + String(nodeStatus), 2, y);
+        y += 14;
+        M5Cardputer.Display.drawString("Name:  " + String(displayName), 2, y);
+        
+        drawFooter("`=Esc");
+        dirty = false;
+    }
+    if (keyPressed && (lastChar == KEY_ESC)) {
+        state = AppState::HOME;
+        dirty = true;
+    }
+}
+
+// ------------------------------------------------------------------
+// Keyboard Processing
+// ------------------------------------------------------------------
+void ReticuleM::processKeyboard() {
+    keyPressed = false;
+    lastChar = 0;
+
+    if (!M5Cardputer.Keyboard.isChange()) return;
+    if (!M5Cardputer.Keyboard.isPressed()) return;
+
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    fnDown = status.fn;
+    ctrlDown = status.ctrl;
+
+    // Special flags already decoded by library
+    if (status.del) { keyPressed = true; lastChar = KEY_BACKSPACE; }
+    if (status.enter) { keyPressed = true; lastChar = KEY_ENTER; }
+    if (status.tab) { keyPressed = true; lastChar = KEY_TAB; }
+    if (status.space) { keyPressed = true; lastChar = ' '; }
+
+    // Map raw physical positions to semantic keys (Cardputer ADV layout)
+    for (auto keyPos : M5Cardputer.Keyboard.keyList()) {
+        // Skip modifier positions
+        if ((keyPos.x == 0 && keyPos.y == 2) ||  // FN
+            (keyPos.x == 1 && keyPos.y == 2) ||  // SHIFT
+            (keyPos.x == 0 && keyPos.y == 3) ||  // CTRL
+            (keyPos.x == 1 && keyPos.y == 3) ||  // OPT
+            (keyPos.x == 2 && keyPos.y == 3)) {   // ALT
+            continue;
+        }
+
+        // Dedicated arrow keys (physical positions on ADV keyboard)
+        if (keyPos.x == 11 && keyPos.y == 2) { lastChar = KEY_UP; keyPressed = true; }
+        else if (keyPos.x == 11 && keyPos.y == 3) { lastChar = KEY_DOWN; keyPressed = true; }
+        else if (keyPos.x == 10 && keyPos.y == 3) { lastChar = KEY_LEFT; keyPressed = true; }
+        else if (keyPos.x == 12 && keyPos.y == 3) { lastChar = KEY_RIGHT; keyPressed = true; }
+        // ESC key (top-left physical key, labeled ` or ~)
+        else if (keyPos.x == 0 && keyPos.y == 0) { lastChar = KEY_ESC; keyPressed = true; }
+        // Enter and Backspace are already covered by status flags, but map anyway
+        else if (keyPos.x == 13 && keyPos.y == 2) { lastChar = KEY_ENTER; keyPressed = true; }
+        else if (keyPos.x == 13 && keyPos.y == 0) { lastChar = KEY_BACKSPACE; keyPressed = true; }
+        else {
+            // Regular printable character
+            auto kv = M5Cardputer.Keyboard.getKeyValue(keyPos);
+            if (status.shift || status.ctrl || M5Cardputer.Keyboard.capslocked()) {
+                lastChar = kv.value_second;
+            } else {
+                lastChar = kv.value_first;
+            }
+            keyPressed = true;
+        }
+        break; // only act on first non-modifier key per frame
+    }
+
+    if (keyPressed && lastChar >= 32 && lastChar < 127) {
+        cursorPos++;
+    } else if ((lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) && cursorPos > 0) {
+        cursorPos--;
+    }
+}
+
+// ------------------------------------------------------------------
+// UI Helpers
+// ------------------------------------------------------------------
+void ReticuleM::clearScreen(uint16_t color) {
+    M5Cardputer.Display.fillScreen(color);
+}
+
+void ReticuleM::drawHeader(const char* title) {
+    M5Cardputer.Display.fillRect(0, 0, SCREEN_W, 14, TFT_NAVY);
+    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setTextDatum(middle_left);
+    M5Cardputer.Display.setTextColor(TFT_WHITE);
+    M5Cardputer.Display.drawString(title, 4, 7);
+}
+
+void ReticuleM::drawFooter(const char* hint) {
+    M5Cardputer.Display.fillRect(0, SCREEN_H - 12, SCREEN_W, 12, TFT_DARKGREY);
+    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setTextDatum(middle_left);
+    M5Cardputer.Display.setTextColor(TFT_WHITE);
+    M5Cardputer.Display.drawString(hint, 2, SCREEN_H - 6);
+}
+
+void ReticuleM::drawStatusBar() {
+    bool ok = wifiConnected && inboxDest;
+    uint16_t color = ok ? TFT_GREEN : TFT_RED;
+    M5Cardputer.Display.fillRect(SCREEN_W - 10, 2, 8, 10, color);
+}
+
+void ReticuleM::drawMenu(const char** items, int count, int selected) {
+    const int lineHeight = 13;
+    int startY = 18;
+    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    for (int i = 0; i < count; i++) {
+        int y = startY + i * lineHeight;
+        if (i == selected) {
+            M5Cardputer.Display.fillRect(0, y, SCREEN_W, lineHeight, TFT_DARKCYAN);
+            M5Cardputer.Display.setTextColor(TFT_BLACK);
+        } else {
+            M5Cardputer.Display.setTextColor(TFT_WHITE);
+        }
+        M5Cardputer.Display.setTextDatum(top_left);
+        M5Cardputer.Display.drawString(String("> ") + items[i], 4, y);
+    }
+}
+
+void ReticuleM::drawMessageList() {
+    if (messageCount == 0) {
+        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setTextDatum(middle_center);
+        M5Cardputer.Display.setTextColor(TFT_DARKGREY);
+        M5Cardputer.Display.drawString("No messages", SCREEN_W / 2, SCREEN_H / 2);
+        return;
+    }
+    const int lineHeight = 13;
+    int start = max(0, messageSelected - 7);
+    for (int i = start; i < messageCount && (i - start) < 9; i++) {
+        int y = 16 + (i - start) * lineHeight;
+        Message m = messages[i];
+        bool active = (i == messageSelected);
+        if (active) {
+            M5Cardputer.Display.fillRect(0, y, SCREEN_W, lineHeight, TFT_DARKCYAN);
+            M5Cardputer.Display.setTextColor(TFT_BLACK);
+        } else {
+            M5Cardputer.Display.setTextColor(m.read ? TFT_LIGHTGREY : TFT_WHITE);
+        }
+        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setTextDatum(top_left);
+        String prefix = m.outgoing ? "\u2191 " : (m.read ? "  " : "\u25cf ");
+        String line = prefix + String(m.sender).substring(0, 10) + ": " + String(m.content).substring(0, 24);
+        M5Cardputer.Display.drawString(line, 2, y);
+    }
+}
