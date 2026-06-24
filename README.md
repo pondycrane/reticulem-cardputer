@@ -94,6 +94,17 @@ See `host-bridge/bridge.py` (legacy JSON-over-serial) or adapt it for native Ret
 
 ## Development Notes
 
+### End-to-End Testing Rule
+
+Whenever the Cardputer is connected (e.g. at `/dev/ttyACM0`), code changes **must be flashed and verified on the device** before merging. This is not optional — Reticulum is a networked protocol, and emulators can't reproduce timing, WiFi, or mesh behavior.
+
+```bash
+# Build, flash, and verify boot output
+pio run -t upload
+pio device monitor
+# Confirm: WiFi connects, Reticulum starts, Inbox destination is announced
+```
+
 ### microReticulum Integration
 
 - **Library:** `microReticulum` is loaded as a PlatformIO library from the local clone at `~/microReticulum`.
