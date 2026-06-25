@@ -94,16 +94,6 @@ LoRaInterface::LoRaInterface(const char* name /*= "LoRaInterface"*/) : RNS::Inte
 
 /*virtual*/ LoRaInterface::~LoRaInterface() {
 	stop();
-#ifdef ARDUINO
-	if (_radio) {
-		delete _radio;
-		_radio = nullptr;
-	}
-	if (_module) {
-		delete _module;
-		_module = nullptr;
-	}
-#endif
 }
 
 bool LoRaInterface::start() {
@@ -115,9 +105,9 @@ bool LoRaInterface::start() {
 #if defined(BOARD_TBEAM) || defined(BOARD_LORA32_V21)
 	// ESP32: T-Beam and LoRa32 use non-default SPI pins — must specify explicitly
 	SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
-	_module = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN, SPI);
-	SX1276* chip = new SX1276(_module);
-	_radio = chip;
+	_module.reset(new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN, SPI));
+	SX1276* chip = new SX1276(_module.get());
+	_radio.reset(chip);
 	// begin(freq MHz, bw kHz, sf, cr, syncWord, power dBm, preamble symbols, LNA gain 0=AGC)
 	int state = chip->begin(frequency, bandwidth, spreading, coding,
 	                        RADIOLIB_SX127X_SYNC_WORD, power, 20, 0);
@@ -134,9 +124,9 @@ bool LoRaInterface::start() {
 	SPI.setPins(RADIO_MISO_PIN, RADIO_SCLK_PIN, RADIO_MOSI_PIN);
 	SPI.begin();
 	// SX1262 Module args: cs, irq=DIO1, rst, busy
-	_module = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI);
-	SX1262* chip = new SX1262(_module);
-	_radio = chip;
+	_module.reset(new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI));
+	SX1262* chip = new SX1262(_module.get());
+	_radio.reset(chip);
 	// DIO2 drives the antenna T/R switch on the RAK4631 SX1262 module
 	chip->setDio2AsRfSwitch(true);
 	// begin(freq MHz, bw kHz, sf, cr, syncWord, power dBm, preamble symbols,
@@ -148,9 +138,9 @@ bool LoRaInterface::start() {
 #elif defined(BOARD_HELTEC_V3)
 	// Heltec WiFi LoRa 32 V3 — ESP32-S3 + SX1262, 1.8V TCXO
 	SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
-	_module = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI);
-	SX1262* chip = new SX1262(_module);
-	_radio = chip;
+	_module.reset(new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI));
+	SX1262* chip = new SX1262(_module.get());
+	_radio.reset(chip);
 	chip->setDio2AsRfSwitch(true);
 	int state = chip->begin(frequency, bandwidth, spreading, coding,
 	                        RADIOLIB_SX126X_SYNC_WORD_PRIVATE, power, 20, 1.8, false);
@@ -166,9 +156,9 @@ bool LoRaInterface::start() {
 	digitalWrite(RADIO_FEM_CE, HIGH);
 	digitalWrite(RADIO_PA_MODE, LOW);   // start in RX mode
 	_pa_mode_pin = RADIO_PA_MODE;
-	_module = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI);
-	SX1262* chip = new SX1262(_module);
-	_radio = chip;
+	_module.reset(new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI));
+	SX1262* chip = new SX1262(_module.get());
+	_radio.reset(chip);
 	chip->setDio2AsRfSwitch(true);
 	int state = chip->begin(frequency, bandwidth, spreading, coding,
 	                        RADIOLIB_SX126X_SYNC_WORD_PRIVATE, power, 20, 1.8, false);
@@ -185,9 +175,9 @@ bool LoRaInterface::start() {
 	#define RADIO_RST_PIN             LORA_RST
 	#define RADIO_BUSY_PIN            LORA_BUSY
 	SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
-	_module = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI);
-	SX1262* chip = new SX1262(_module);
-	_radio = chip;
+	_module.reset(new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, SPI));
+	SX1262* chip = new SX1262(_module.get());
+	_radio.reset(chip);
 	chip->setDio2AsRfSwitch(true);
 	int state = chip->begin(frequency, bandwidth, spreading, coding,
 	                        RADIOLIB_SX126X_SYNC_WORD_PRIVATE, power, 20, 1.6, false);
@@ -199,27 +189,19 @@ bool LoRaInterface::start() {
 
 	if (state != RADIOLIB_ERR_NONE) {
 		ERRORF("LoRa init failed, code %d. Check wiring/board define.", state);
-#ifdef ARDUINO
-		if (_radio) {
-			delete _radio;
-			_radio = nullptr;
-		}
-		if (_module) {
-			delete _module;
-			_module = nullptr;
-		}
-#endif
+		_radio.reset();
+		_module.reset();
 		return false;
 	}
 
 	// Enter continuous receive mode
-	int state = _radio->startReceive();
+	state = _radio->startReceive();
 	if (state != RADIOLIB_ERR_NONE) {
 		WARNINGF("LoRaInterface: startReceive failed, code %d", state);
 		delay(10);
 		state = _radio->startReceive();
 		if (state != RADIOLIB_ERR_NONE) {
-			ERRORF("LoRaInterface: startReceive retry also failed, stopping interface");
+			ERROR("LoRaInterface: startReceive retry also failed, stopping interface");
 			_online = false;
 		}
 	}
@@ -301,7 +283,7 @@ void LoRaInterface::loop() {
 				delay(10);
 				rx_state = _radio->startReceive();
 				if (rx_state != RADIOLIB_ERR_NONE) {
-					ERRORF("LoRaInterface: startReceive retry also failed, stopping interface");
+					ERROR("LoRaInterface: startReceive retry also failed, stopping interface");
 					_online = false;
 				}
 			}
@@ -375,7 +357,7 @@ void LoRaInterface::loop() {
 				delay(10);
 				tx_state = _radio->startReceive();
 				if (tx_state != RADIOLIB_ERR_NONE) {
-					ERRORF("LoRaInterface: startReceive retry also failed, stopping interface");
+					ERROR("LoRaInterface: startReceive retry also failed, stopping interface");
 					_online = false;
 				}
 			}
