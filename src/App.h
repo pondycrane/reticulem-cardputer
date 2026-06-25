@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 #include <LoRaInterface.h>
+#include "KeyboardManager.h"
+#include "MessageStore.h"
 
 // Additional key constants (Cardputer lacks dedicated arrow keys)
 #define KEY_UP     0x52
@@ -34,22 +36,7 @@ enum class AppState {
 };
 
 // Message record
-struct Message {
-    uint32_t id;
-    uint32_t timestamp;
-    char sender[64];
-    char recipient[64];
-    char content[256];
-    bool outgoing;
-    bool read;
-};
 
-// Contact record
-struct Contact {
-    char name[32];
-    char hash[128];  // Reticulum truncated hex hash (display)
-    RNS::Bytes fullHash; // Full 32-byte identity hash for Identity::recall()
-};
 
 // Forward declare custom announce handler
 class ReticuleMAnnounceHandler;
@@ -110,21 +97,11 @@ private:
     void renderSplash();
     
     // ---- Keyboard ----
-    void processKeyboard();
-    bool keyPressed;
-    char lastChar;
-    bool fnDown;
-    bool ctrlDown;
-    int cursorPos;
+    KeyboardManager keyboard;
     
     // ---- Data ----
-    static constexpr int MAX_MESSAGES = 32;
-    static constexpr int MAX_CONTACTS = 16;
-    Message messages[MAX_MESSAGES];
-    int messageCount;
+    MessageStore messageStore;
     int messageSelected;
-    Contact contacts[MAX_CONTACTS];
-    int contactCount;
     int contactSelected;
     
     char composeTo[128];
