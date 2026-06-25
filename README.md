@@ -164,12 +164,31 @@ See `host-bridge/bridge.py` (legacy JSON-over-serial) or adapt it for native Ret
 
 Whenever the Cardputer is connected (e.g. at `/dev/ttyACM0`), code changes **must be flashed and verified on the device** before merging. This is not optional — Reticulum is a networked protocol, and emulators can't reproduce timing, WiFi, or mesh behavior.
 
+#### Manual verification
+
 ```bash
 # Build, flash, and verify boot output
 pio run -t upload
 pio device monitor
 # Confirm: WiFi connects, Reticulum starts, Inbox destination is announced
 ```
+
+#### Automated hardware smoke test
+
+A PlatformIO unit test environment (`cardputer_test`) is available to flash the device and run an on-device boot assertion:
+
+```bash
+# Identify your Cardputer serial port (typically /dev/ttyACM0 on Linux)
+pio test --environment cardputer_test --upload-port /dev/ttyACM0
+```
+
+This test:
+1. Builds the firmware with the same flags as the main `cardputer` environment
+2. Flashes it to the device
+3. Waits for boot and runs a minimal assertion that the firmware is alive
+4. Reports pass/fail via serial
+
+Add this command to your pre-merge checklist. Any code change should pass the smoke test before creating a PR.
 
 ### microReticulum Integration
 

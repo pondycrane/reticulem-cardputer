@@ -7,6 +7,7 @@
 #include <MsgPack.h>
 #include <CardputerUDPInterface.h>
 #include <memory>
+#include <vector>
 #include <LoRaInterface.h>
 
 // Additional key constants (Cardputer lacks dedicated arrow keys)
@@ -103,6 +104,7 @@ private:
     void drawFooter(const char* hint);
     void drawStatusBar();
     void drawMenu(const char** items, int count, int selected);
+    void wrapText(const String& text, int maxPixelWidth, std::vector<String>& lines);
     void drawMessageList();
     void drawComposeScreen();
     void renderSplash();

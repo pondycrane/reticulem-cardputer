@@ -678,11 +678,11 @@ void ReticuleM::runInbox() {
                 M5Cardputer.Display.drawString(String("To: ") + messages[messageSelected].recipient, 2, y);
                 y += 16;
                 String body = messages[messageSelected].content;
-                int lineWidth = (SCREEN_W - 4) / 6;
-                for (int i = 0; i < body.length() && y < SCREEN_H - 16; i += lineWidth) {
-                    int endPos = i + lineWidth;
-                    if (endPos > body.length()) endPos = body.length();
-                    M5Cardputer.Display.drawString(body.substring(i, endPos), 2, y);
+                std::vector<String> lines;
+                wrapText(body, SCREEN_W - 4, lines);
+                for (const String& line : lines) {
+                    if (y >= SCREEN_H - 16) break;
+                    M5Cardputer.Display.drawString(line, 2, y);
                     y += 12;
                 }
                 drawFooter("Any key to return");
@@ -736,11 +736,11 @@ void ReticuleM::runCompose() {
         M5Cardputer.Display.setTextColor(TFT_WHITE);
         String bodyPreview = String(composeBody);
         if (composeField == 1 && cursorVisible) bodyPreview += "_";
-        int lineWidth = (SCREEN_W - 36) / 6;
-        for (int i = 0; i < bodyPreview.length() && y < SCREEN_H - 14; i += lineWidth) {
-            int endPos = i + lineWidth;
-            if (endPos > bodyPreview.length()) endPos = bodyPreview.length();
-            M5Cardputer.Display.drawString(bodyPreview.substring(i, endPos), 36, y);
+        std::vector<String> lines;
+        wrapText(bodyPreview, SCREEN_W - 36, lines);
+        for (const String& line : lines) {
+            if (y >= SCREEN_H - 14) break;
+            M5Cardputer.Display.drawString(line, 36, y);
             y += 12;
         }
 
@@ -1080,6 +1080,31 @@ void ReticuleM::processKeyboard() {
         cursorPos++;
     } else if ((lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) && cursorPos > 0) {
         cursorPos--;
+    }
+}
+
+// ------------------------------------------------------------------
+// wrapText — pixel-exact line breaking
+// ------------------------------------------------------------------
+void ReticuleM::wrapText(const String& text, int maxPixelWidth, std::vector<String>& lines) {
+    lines.clear();
+    int start = 0;
+    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    while (start < text.length()) {
+        int end = text.length();
+        // Try to find a break point within the width
+        while (end > start && M5Cardputer.Display.textWidth(text.substring(start, end)) > maxPixelWidth) {
+            end--;
+        }
+        // If even a single character overflows, force break at character boundary
+        if (end == start) {
+            end = start + 1;
+            while (end < text.length() && M5Cardputer.Display.textWidth(text.substring(start, end + 1)) <= maxPixelWidth) {
+                end++;
+            }
+        }
+        lines.push_back(text.substring(start, end));
+        start = end;
     }
 }
 
