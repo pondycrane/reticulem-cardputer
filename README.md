@@ -9,11 +9,13 @@ Unlike a dumb terminal, ReticuleM runs a full **microReticulum stack** on the de
 ```
 +---------------+      WiFi UDP (broadcast)        +-----------------+
 | M5Stack       |  <--- Reticulum packets --->     | Reticulum Node  |
-| Cardputer     |                                    | (Pi, laptop,    |
-| (microRNS)    |                                    |  or other MCU)  |
+| Cardputer     |      LoRa (868/915 MHz)          | (Pi, laptop,    |
+| (microRNS)    |  <--- Reticulum packets --->     |  or other MCU)  |
 +---------------+                                    +-----------------+
-         |                                                  |
-         +------------------ LXMF bridge ------------------+
+    |                                                      |
+    +--- Cap LoRa-1262 (optional)                          |
+    |   SX1262 module on EXT 2.54-14P header               |
+    +------------------ LXMF bridge ----------------------+
          (optional: Python bridge relays to LXMF ecosystem)
 ```
 
@@ -22,13 +24,77 @@ Unlike a dumb terminal, ReticuleM runs a full **microReticulum stack** on the de
 | Feature | Detail |
 |---|---|
 | **Mesh Stack** | Native microReticulum (Identity, Destination, Packet, Transport, Path Discovery) |
-| **Interface** | WiFi UDP broadcast on port 4242 (AutoInterface compatible) |
+| **Interface** | WiFi UDP broadcast on port 4242 (AutoInterface compatible) + optional LoRa (SX1262) |
 | **Crypto** | Ed25519 signatures, X25519 key exchange, AES-128-CBC (handled by microReticulum) |
 | **App Protocol** | Custom `reticulem.inbox` over Reticulum Links/Packets |
 | **Payload** | Compact JSON: `{v:1, n:name, f:hash, b:body}` |
 | **UI** | Splash → Home → Inbox / Compose / Contacts / Settings / Status |
 | **Discovery** | Announces every 60s; incoming announces auto-populate contacts |
 | **Storage** | Identity persisted to SPIFFS; settings JSON; messages in SRAM |
+
+## LoRa Interface
+
+When a **Cap LoRa-1262** (SX1262) module is attached to the CardputerADV's EXT 2.54-14P header, ReticuleM automatically initialises it as a second Reticulum interface alongside WiFi UDP. The two interfaces operate in parallel — packets received over LoRa are routed through the same mesh, and messages can be sent over whichever path is available.
+
+### Pinout (EXT 2.54-14P header to Cap LoRa-1262)
+
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| SCLK   | 40   | SPI clock |
+| MISO   | 39   | SPI master-in, slave-out |
+| MOSI   | 14   | SPI master-out, slave-in |
+| CS     | 5    | SPI chip-select (active low) |
+| DIO1   | 4    | SX1262 IRQ line |
+| RST    | 3    | SX1262 reset |
+| BUSY   | 6    | SX1262 busy indicator |
+
+### Configuration
+
+The LoRa radio is configured at compile time via PlatformIO build flags in `platformio.ini`:
+
+```ini
+-DBOARD_CAP_LORA1262
+-DLORA_SCLK=40
+-DLORA_MISO=39
+-DLORA_MOSI=14
+-DLORA_CS=5
+-DLORA_DIO1=4
+-DLORA_RST=3
+-DLORA_BUSY=6
+-DLORA_FREQ=868.0
+```
+
+- **Frequency:** Set via `LORA_FREQ` (default 868.0 MHz for EU; change to 915.0 for US).
+- **Radio parameters:** Bandwidth 125 kHz, SF 8, CR 4/5, TX power 17 dBm (compile-time constants in `lib/CapLoRaInterface/LoRaInterface.h`).
+- **Init is non-fatal:** If no module is attached or init fails, the device boots with WiFi only — no crash.
+
+### Status Display
+
+On the **Status** screen you'll see a LoRa line showing:
+
+```
+LoRa:  RSSI -112 dBm  SNR 3.2
+```
+
+When no packet has been received yet:
+
+```
+LoRa:  Online  (no signal yet)
+```
+
+When the module is absent or offline:
+
+```
+LoRa:  Offline
+```
+
+The **status bar** (top-right corner) shows two coloured squares:
+- **Left square:** LoRa indicator (green = online + destination active, red = offline)
+- **Right square:** WiFi indicator (green = connected, red = disconnected)
+
+### Split-Packet Protocol
+
+LoRa frames are limited to 254 bytes of payload (255 bytes minus 1 header byte). Messages larger than this are automatically split into two frames with a matching sequence number and reassembled on the receiving side.
 
 ## Quick Start
 
@@ -115,7 +181,6 @@ pio device monitor
 ### Limitations
 
 - **No LXMF on-device.** LXMF is not yet implemented in microReticulum. ReticuleM uses its own lightweight app protocol. A bridge can map to LXMF if desired.
-- **WiFi only.** No LoRa interface is configured in this build, but the Cardputer ADV could be extended with one.
 - **RAM messages.** Messages are stored in SRAM and lost on reboot. SPIFFS-based message persistence is a future enhancement.
 - **Path discovery timeout.** Sending to an unknown destination requires an announce from that node within ~30s, or the send fails.
 

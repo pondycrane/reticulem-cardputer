@@ -7,18 +7,16 @@
 #ifdef ARDUINO
 #include <SPI.h>
 #include <RadioLib.h>
+#include <memory>
 #endif
 
 #include <stdint.h>
+#include <cmath>
 
 class LoRaInterface : public RNS::InterfaceImpl {
 
 public:
-	//z def get_address_for_if(name):
-	//z def get_broadcast_for_if(name):
 
-public:
-	//p def __init__(self, owner, name, device=None, bindip=None, bindport=None, forwardip=None, forwardport=None):
 	LoRaInterface(const char* name = "LoRaInterface");
 	virtual ~LoRaInterface();
 
@@ -26,7 +24,11 @@ public:
 	virtual void stop();
 	virtual void loop();
 
-	//virtual inline std::string toString() const { return "LoRaInterface[" + name() + "]"; }
+public:
+	// Signal quality accessors — updated after each received packet
+	float getRSSI() const { return _lastRSSI; }
+	float getSNR() const { return _lastSNR; }
+	bool isOnline() const { return _online; }
 
 private:
 	virtual bool send_outgoing(const RNS::Bytes& data);
@@ -43,6 +45,11 @@ private:
 	//uint8_t buffer[Type::Reticulum::MTU] = {0};
 	const uint8_t message_count = 0;
 	RNS::Bytes buffer;
+	static constexpr size_t MAX_BUFFER_SIZE = 1024;  // Limit reassembly buffer
+
+	// Last received signal metrics (RadioLib units: dBm, dB)
+	float _lastRSSI = NAN;
+	float _lastSNR  = NAN;
 
 	uint8_t _rx_seq     = SEQ_UNSET;  // sequence of split RX in progress
 	uint8_t _tx_seq_ctr = 0;          // rolling TX split sequence counter
@@ -59,8 +66,8 @@ private:
 	const int   power     = 17;      // dBm
 
 #ifdef ARDUINO
-	Module*        _module      = nullptr;
-	PhysicalLayer* _radio       = nullptr;
+	std::unique_ptr<Module> _module;
+	std::unique_ptr<PhysicalLayer> _radio;
 	int            _pa_mode_pin = -1;    // V4 FEM PA mode pin; -1 = not present
 #endif
 

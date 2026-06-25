@@ -8,32 +8,39 @@ nodes:
   - id: create-plan
     command: archon-create-plan
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
+    effort: high
 
   - id: plan-setup
     command: archon-plan-setup
     depends_on: [create-plan]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: confirm-plan
     command: archon-confirm-plan
     depends_on: [plan-setup]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: implement-tasks
     command: archon-implement-tasks
     depends_on: [confirm-plan]
     context: fresh
-    # model override removed — uses default Pi/DeepSeek model
+    model: openrouter/deepseek/deepseek-v3.2
+    effort: max
 
   - id: validate
     command: archon-validate
     depends_on: [implement-tasks]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: finalize-pr
     command: archon-finalize-pr
     depends_on: [validate]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: verify-pr-base
     bash: |
@@ -53,49 +60,60 @@ nodes:
     command: archon-pr-review-scope
     depends_on: [verify-pr-base]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: sync
     command: archon-sync-pr-with-main
     depends_on: [review-scope]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: code-review
     command: archon-code-review-agent
     depends_on: [sync]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: error-handling
     command: archon-error-handling-agent
     depends_on: [sync]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: test-coverage
     command: archon-test-coverage-agent
     depends_on: [sync]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: comment-quality
     command: archon-comment-quality-agent
     depends_on: [sync]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: docs-impact
     command: archon-docs-impact-agent
     depends_on: [sync]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: synthesize
     command: archon-synthesize-review
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash
 
   - id: implement-fixes
     command: archon-implement-review-fixes
     depends_on: [synthesize]
     context: fresh
+    model: openrouter/deepseek/deepseek-v3.2
+    effort: max
 
   - id: summary
     command: archon-workflow-summary
     depends_on: [implement-fixes]
     context: fresh
+    model: openrouter/deepseek/deepseek-v4-flash

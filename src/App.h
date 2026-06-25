@@ -7,6 +7,7 @@
 #include <MsgPack.h>
 #include <CardputerUDPInterface.h>
 #include <memory>
+#include <LoRaInterface.h>
 
 // Additional key constants (Cardputer lacks dedicated arrow keys)
 #define KEY_UP     0x52
@@ -82,6 +83,7 @@ private:
     
     // ---- Async WiFi ----
     void checkWiFiConnection();
+    void checkLoRaConnection();
     
     // ---- State Machine ----
     AppState state;
@@ -175,6 +177,10 @@ private:
     
     // ---- Status info ----
     bool wifiConnected;
+    bool loraOnline;
+    float loraRSSI;
+    float loraSNR;
+    char loraError[64];
     char ownHash[128];
     char nodeStatus[64];
     int peerCount;
