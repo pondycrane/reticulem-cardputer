@@ -117,3 +117,23 @@ nodes:
     depends_on: [implement-fixes]
     context: fresh
     model: openrouter/deepseek/deepseek-v4-flash
+
+  # ─── Push notification via ntfy ──────────────────────────────
+  # To enable, .archon/mcp/ntfy.json must exist (see docs/mcp-servers.md)
+  - id: check-ntfy
+    bash: test -f .archon/mcp/ntfy.json && echo 'true' || echo 'false'
+    depends_on: [summary]
+
+  - id: notify
+    depends_on: [check-ntfy, summary]
+    when: "$check-ntfy.output == 'true'"
+    mcp: .archon/mcp/ntfy.json
+    allowed_tools: []
+    prompt: |
+      Send a push notification summarizing the completed feature development workflow.
+      Summary output:
+      $summary.output
+      Send with:
+      - title: "🚀 Feature Dev Complete"
+      - message: 1-2 sentence summary — what was built, key metrics. Short enough for a lock screen.
+      - priority: 4

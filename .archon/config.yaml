@@ -7,7 +7,8 @@ assistant: pi
 # Assistant defaults (override global)
 assistants:
   pi:
-    model: openrouter/deepseek/deepseek-v3.2
+    model: openrouter/deepseek/deepseek-v4-flash
+    enableExtensions: true
 
 # Worktree settings — branch is master, not main
 worktree:
