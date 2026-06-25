@@ -180,6 +180,7 @@ private:
     bool loraOnline;
     float loraRSSI;
     float loraSNR;
+    char loraError[64];
     char ownHash[128];
     char nodeStatus[64];
     int peerCount;

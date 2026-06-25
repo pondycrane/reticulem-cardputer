@@ -76,6 +76,7 @@ ReticuleM::ReticuleM()
     memset(displayName, 0, sizeof(displayName));
     memset(ownHash, 0, sizeof(ownHash));
     memset(nodeStatus, 0, sizeof(nodeStatus));
+    memset(loraError, 0, sizeof(loraError));
     memset(pendingSendTo, 0, sizeof(pendingSendTo));
     memset(pendingSendBody, 0, sizeof(pendingSendBody));
     
@@ -184,14 +185,17 @@ void ReticuleM::checkLoRaConnection() {
         if (loraOnline) {
             loraRSSI = loraImpl->getRSSI();
             loraSNR  = loraImpl->getSNR();
+            loraError[0] = '\0';  // Clear error
         } else {
             loraRSSI = NAN;
-            loraSNR  = NAN;
+            loraSNR = NAN;
+            snprintf(loraError, sizeof(loraError), "Init failed");
         }
     } else {
         loraOnline = false;
         loraRSSI = NAN;
         loraSNR = NAN;
+        snprintf(loraError, sizeof(loraError), "No module");
     }
 }
 
@@ -458,7 +462,12 @@ void ReticuleM::sendNativeMessage(const char* recipient_hex, const char* body) {
     RNS::Bytes hash;
     try {
         hash.assignHex(hex_clean);
+    } catch (const std::exception& e) {
+        WARNINGF("Invalid hex format: %s", e.what());
+        strncpy(nodeStatus, "Bad hash", sizeof(nodeStatus));
+        return;
     } catch (...) {
+        WARNING("Unknown exception during hex conversion");
         strncpy(nodeStatus, "Bad hash", sizeof(nodeStatus));
         return;
     }
@@ -543,7 +552,13 @@ void ReticuleM::flushPendingSend() {
     RNS::Bytes hash;
     try {
         hash.assignHex(pendingSendTo);
+    } catch (const std::exception& e) {
+        WARNINGF("Invalid pending hex format: %s", e.what());
+        pendingSendActive = false;
+        strncpy(nodeStatus, "Bad pending hash", sizeof(nodeStatus));
+        return;
     } catch (...) {
+        WARNING("Unknown exception during pending hex conversion");
         pendingSendActive = false;
         strncpy(nodeStatus, "Bad pending hash", sizeof(nodeStatus));
         return;
@@ -971,7 +986,9 @@ void ReticuleM::runStatus() {
         y += 14;
         
         // LoRa status line
-        if (loraOnline && !std::isnan(loraRSSI)) {
+        if (loraError[0] != '\0') {
+            snprintf(lineBuf, sizeof(lineBuf), "LoRa:  %s", loraError);
+        } else if (loraOnline && !std::isnan(loraRSSI)) {
             snprintf(lineBuf, sizeof(lineBuf), "LoRa:  RSSI %.0f dBm  SNR %.1f", loraRSSI, loraSNR);
         } else if (loraOnline) {
             snprintf(lineBuf, sizeof(lineBuf), "LoRa:  Online  (no signal yet)");

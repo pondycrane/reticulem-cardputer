@@ -94,6 +94,16 @@ LoRaInterface::LoRaInterface(const char* name /*= "LoRaInterface"*/) : RNS::Inte
 
 /*virtual*/ LoRaInterface::~LoRaInterface() {
 	stop();
+#ifdef ARDUINO
+	if (_radio) {
+		delete _radio;
+		_radio = nullptr;
+	}
+	if (_module) {
+		delete _module;
+		_module = nullptr;
+	}
+#endif
 }
 
 bool LoRaInterface::start() {
@@ -189,11 +199,30 @@ bool LoRaInterface::start() {
 
 	if (state != RADIOLIB_ERR_NONE) {
 		ERRORF("LoRa init failed, code %d. Check wiring/board define.", state);
+#ifdef ARDUINO
+		if (_radio) {
+			delete _radio;
+			_radio = nullptr;
+		}
+		if (_module) {
+			delete _module;
+			_module = nullptr;
+		}
+#endif
 		return false;
 	}
 
 	// Enter continuous receive mode
-	_radio->startReceive();
+	int state = _radio->startReceive();
+	if (state != RADIOLIB_ERR_NONE) {
+		WARNINGF("LoRaInterface: startReceive failed, code %d", state);
+		delay(10);
+		state = _radio->startReceive();
+		if (state != RADIOLIB_ERR_NONE) {
+			ERRORF("LoRaInterface: startReceive retry also failed, stopping interface");
+			_online = false;
+		}
+	}
 
 	INFO("LoRa init succeeded.");
 	TRACEF("LoRa bandwidth is %.2f Kbps", Utilities::OS::round(_bitrate/1000.0, 2));
@@ -207,7 +236,10 @@ void LoRaInterface::stop() {
 
 #ifdef ARDUINO
 	if (_radio) {
-		_radio->standby();
+		int standby_state = _radio->standby();
+		if (standby_state != RADIOLIB_ERR_NONE) {
+			WARNINGF("LoRaInterface: standby failed, code %d", standby_state);
+		}
 	}
 #endif
 
@@ -263,7 +295,16 @@ void LoRaInterface::loop() {
 
 			// Re-arm receive mode (required after every packet on SX1262;
 			// harmless on SX1276)
-			_radio->startReceive();
+			int rx_state = _radio->startReceive();
+			if (rx_state != RADIOLIB_ERR_NONE) {
+				WARNINGF("LoRaInterface: startReceive failed, code %d", rx_state);
+				delay(10);
+				rx_state = _radio->startReceive();
+				if (rx_state != RADIOLIB_ERR_NONE) {
+					ERRORF("LoRaInterface: startReceive retry also failed, stopping interface");
+					_online = false;
+				}
+			}
 		}
 #endif
 	}
@@ -328,7 +369,16 @@ void LoRaInterface::loop() {
 				}
 			}
 
-			_radio->startReceive();
+			int tx_state = _radio->startReceive();
+			if (tx_state != RADIOLIB_ERR_NONE) {
+				WARNINGF("LoRaInterface: startReceive failed, code %d", tx_state);
+				delay(10);
+				tx_state = _radio->startReceive();
+				if (tx_state != RADIOLIB_ERR_NONE) {
+					ERRORF("LoRaInterface: startReceive retry also failed, stopping interface");
+					_online = false;
+				}
+			}
 #endif
 			TRACE("LoRaInterface: sent bytes");
 		}
