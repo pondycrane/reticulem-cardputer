@@ -649,7 +649,8 @@ void ReticuleM::runHome() {
 // Inbox
 // ------------------------------------------------------------------
 void ReticuleM::runInbox() {
-    bool dirty = stateChanged;
+    static bool dirty = true;
+    if (stateChanged) dirty = true;
 
     if (dirty) {
         clearScreen();
@@ -716,7 +717,15 @@ void ReticuleM::runInbox() {
 // Compose
 // ------------------------------------------------------------------
 void ReticuleM::runCompose() {
-    bool dirty = stateChanged;
+    static bool dirty = true;
+    if (stateChanged) dirty = true;
+
+    // Force redraw when cursor blinks so the cursor visually toggles
+    static bool lastCursorVis = false;
+    if (cursorVisible != lastCursorVis) {
+        dirty = true;
+        lastCursorVis = cursorVisible;
+    }
 
     if (dirty) {
         clearScreen();
@@ -802,7 +811,8 @@ void ReticuleM::runCompose() {
 // Contacts
 // ------------------------------------------------------------------
 void ReticuleM::runContacts() {
-    bool dirty = stateChanged;
+    static bool dirty = true;
+    if (stateChanged) dirty = true;
 
     if (dirty) {
         clearScreen();
@@ -859,7 +869,15 @@ void ReticuleM::runContacts() {
 // Settings
 // ------------------------------------------------------------------
 void ReticuleM::runSettings() {
-    bool dirty = stateChanged;
+    static bool dirty = true;
+    if (stateChanged) dirty = true;
+
+    // Force redraw when cursor blinks
+    static bool lastCursorVis = false;
+    if (cursorVisible != lastCursorVis) {
+        dirty = true;
+        lastCursorVis = cursorVisible;
+    }
     const char* labels[] = {"WiFi SSID", "WiFi Pass", "Display Name", "Transport Node", "Save"};
     const int scount = 5;
 
@@ -967,7 +985,8 @@ void ReticuleM::runSettings() {
 // Status
 // ------------------------------------------------------------------
 void ReticuleM::runStatus() {
-    bool dirty = stateChanged;
+    static bool dirty = true;
+    if (stateChanged) dirty = true;
     if (dirty) {
         clearScreen();
         drawHeader("Status");
@@ -1088,21 +1107,24 @@ void ReticuleM::processKeyboard() {
 // ------------------------------------------------------------------
 void ReticuleM::wrapText(const String& text, int maxPixelWidth, std::vector<String>& lines) {
     lines.clear();
-    int start = 0;
+    if (text.length() == 0) return;
+
     M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
-    while (start < text.length()) {
-        int end = text.length();
-        // Try to find a break point within the width
-        while (end > start && M5Cardputer.Display.textWidth(text.substring(start, end)) > maxPixelWidth) {
-            end--;
-        }
-        // If even a single character overflows, force break at character boundary
-        if (end == start) {
-            end = start + 1;
-            while (end < text.length() && M5Cardputer.Display.textWidth(text.substring(start, end + 1)) <= maxPixelWidth) {
-                end++;
-            }
-        }
+
+    int start = 0;
+    const int len = text.length();
+    const char* cstr = text.c_str();
+
+    while (start < len) {
+        // textLength returns how many chars from this position fit in maxPixelWidth
+        int charsThatFit = M5Cardputer.Display.textLength(cstr + start, maxPixelWidth);
+
+        // Safety: at minimum take one character (handles zero-width edge cases)
+        if (charsThatFit < 1) charsThatFit = 1;
+
+        int end = start + charsThatFit;
+        if (end > len) end = len;
+
         lines.push_back(text.substring(start, end));
         start = end;
     }
