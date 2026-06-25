@@ -58,6 +58,9 @@ ReticuleM::ReticuleM()
       pendingSendActive(false),
       pendingSendStart(0),
       wifiConnected(false),
+      loraOnline(false),
+      loraRSSI(NAN),
+      loraSNR(NAN),
       peerCount(0),
       nextMsgId(1),
       homeSelected(0),
@@ -120,6 +123,7 @@ void ReticuleM::update() {
     if (millis() - lastStatusUpdate > 2000) {
         lastStatusUpdate = millis();
         wifiConnected = (WiFi.status() == WL_CONNECTED);
+        checkLoRaConnection();
         drawStatusBar();
     }
 
@@ -174,6 +178,23 @@ void ReticuleM::initWiFi() {
     Serial.print("Connecting to WiFi (async)...");
 }
 
+void ReticuleM::checkLoRaConnection() {
+    if (loraImpl) {
+        loraOnline = loraImpl->isOnline();
+        if (loraOnline) {
+            loraRSSI = loraImpl->getRSSI();
+            loraSNR  = loraImpl->getSNR();
+        } else {
+            loraRSSI = NAN;
+            loraSNR  = NAN;
+        }
+    } else {
+        loraOnline = false;
+        loraRSSI = NAN;
+        loraSNR = NAN;
+    }
+}
+
 void ReticuleM::checkWiFiConnection() {
     if (wifiConnected || wifiConnectStart == 0) return;
     
@@ -212,11 +233,24 @@ void ReticuleM::initReticulum() {
         udpInterface.start();
 
         // LoRa interface — Cap LoRa-1262 (U214) on EXT 2.54-14P
-        loraImpl = std::make_unique<LoRaInterface>("lora0");
-        loraInterface = RNS::Interface(loraImpl.get());
-        loraInterface.mode(RNS::Type::Interface::MODE_GATEWAY);
-        RNS::Transport::register_interface(loraInterface);
-        loraInterface.start();
+        // Init failure is non-fatal — degrade gracefully to WiFi-only
+        {
+            loraImpl = std::make_unique<LoRaInterface>("lora0");
+            loraInterface = RNS::Interface(loraImpl.get());
+            loraInterface.mode(RNS::Type::Interface::MODE_GATEWAY);
+            try {
+                if (loraImpl->start()) {
+                    RNS::Transport::register_interface(loraInterface);
+                    INFO("LoRa interface registered");
+                } else {
+                    WARNING("LoRa interface start returned false — continuing with WiFi only");
+                    loraImpl.reset();
+                }
+            } catch (const std::exception& e) {
+                WARNINGF("LoRa interface exception: %s — continuing with WiFi only", e.what());
+                loraImpl.reset();
+            }
+        }
         
         // Reticulum instance
         reticulum = RNS::Reticulum();
@@ -935,6 +969,18 @@ void ReticuleM::runStatus() {
         }
         M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
+        
+        // LoRa status line
+        if (loraOnline && !std::isnan(loraRSSI)) {
+            snprintf(lineBuf, sizeof(lineBuf), "LoRa:  RSSI %.0f dBm  SNR %.1f", loraRSSI, loraSNR);
+        } else if (loraOnline) {
+            snprintf(lineBuf, sizeof(lineBuf), "LoRa:  Online  (no signal yet)");
+        } else {
+            snprintf(lineBuf, sizeof(lineBuf), "LoRa:  Offline");
+        }
+        M5Cardputer.Display.drawString(lineBuf, 2, y);
+        y += 14;
+        
         snprintf(lineBuf, sizeof(lineBuf), "Hash:  %.28s", ownHash);
         M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
@@ -1044,9 +1090,15 @@ void ReticuleM::drawFooter(const char* hint) {
 }
 
 void ReticuleM::drawStatusBar() {
-    bool ok = wifiConnected && inboxDest;
-    uint16_t color = ok ? TFT_GREEN : TFT_RED;
-    M5Cardputer.Display.fillRect(SCREEN_W - 10, 2, 8, 10, color);
+    // LoRa indicator (left)
+    bool loraOk = loraOnline && inboxDest;
+    uint16_t loraColor = loraOk ? TFT_GREEN : TFT_RED;
+    M5Cardputer.Display.fillRect(SCREEN_W - 22, 2, 10, 10, loraColor);
+    
+    // WiFi indicator (right)
+    bool wifiOk = wifiConnected && inboxDest;
+    uint16_t wifiColor = wifiOk ? TFT_GREEN : TFT_RED;
+    M5Cardputer.Display.fillRect(SCREEN_W - 10, 2, 8, 10, wifiColor);
 }
 
 void ReticuleM::drawMenu(const char** items, int count, int selected) {

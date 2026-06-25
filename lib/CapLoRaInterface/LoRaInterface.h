@@ -10,6 +10,7 @@
 #endif
 
 #include <stdint.h>
+#include <cmath>
 
 class LoRaInterface : public RNS::InterfaceImpl {
 
@@ -28,6 +29,12 @@ public:
 
 	//virtual inline std::string toString() const { return "LoRaInterface[" + name() + "]"; }
 
+public:
+	// Signal quality accessors — updated after each received packet
+	float getRSSI() const { return _lastRSSI; }
+	float getSNR() const { return _lastSNR; }
+	bool isOnline() const { return _online; }
+
 private:
 	virtual bool send_outgoing(const RNS::Bytes& data);
 	void on_incoming(const RNS::Bytes& data);
@@ -43,6 +50,10 @@ private:
 	//uint8_t buffer[Type::Reticulum::MTU] = {0};
 	const uint8_t message_count = 0;
 	RNS::Bytes buffer;
+
+	// Last received signal metrics (RadioLib units: dBm, dB)
+	float _lastRSSI = NAN;
+	float _lastSNR  = NAN;
 
 	uint8_t _rx_seq     = SEQ_UNSET;  // sequence of split RX in progress
 	uint8_t _tx_seq_ctr = 0;          // rolling TX split sequence counter

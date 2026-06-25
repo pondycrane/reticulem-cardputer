@@ -226,8 +226,11 @@ void LoRaInterface::loop() {
 			int state = _radio->readData(rxBuf, len);
 
 			if (state == RADIOLIB_ERR_NONE && len > 1) {
-				Serial.println("RSSI: " + String(_radio->getRSSI()));
-				Serial.println("Snr: "  + String(_radio->getSNR()));
+				// Store signal metrics for UI access
+				_lastRSSI = _radio->getRSSI();
+				_lastSNR  = _radio->getSNR();
+				Serial.println("RSSI: " + String(_lastRSSI));
+				Serial.println("Snr: "  + String(_lastSNR));
 
 				uint8_t hdr = rxBuf[0];
 				uint8_t seq = packetSequence(hdr);
