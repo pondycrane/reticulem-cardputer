@@ -1,0 +1,40 @@
+name: analyze-codebase
+description: |
+  Analyze the codebase structure and generate a summary report.
+  Uses DeepSeek v3.2 for analysis, with a cheaper model for the initial scan.
+
+provider: pi
+model: openrouter/deepseek/deepseek-v3.2
+
+nodes:
+  - id: scan
+    prompt: |
+      Scan the project structure. List all source files and key directories.
+      Focus on: src/, lib/, include/, and any config files.
+    context: fresh
+
+  - id: analyze
+    prompt: |
+      Based on the scan results below, provide a detailed analysis of:
+      1. Architecture overview
+      2. Key components and their relationships
+      3. Build system and dependencies
+      4. Testing strategy (if any)
+
+      Scan results:
+      $scan.output
+
+      Write the analysis to $ARTIFACTS_DIR/analysis.md
+    depends_on: [scan]
+    context: fresh
+
+  - id: summarize
+    model: openrouter/deepseek/deepseek-chat      # cheaper model for final summary
+    prompt: |
+      Summarize the analysis below into a concise README section.
+
+      $analyze.output
+
+      Output the summary as plain text.
+    depends_on: [analyze]
+    context: fresh

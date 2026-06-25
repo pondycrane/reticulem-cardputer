@@ -1,6 +1,7 @@
 #include "App.h"
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <LoRaInterface.h>
 
 // ------------------------------------------------------------------
 // Global app pointer for C-style callbacks
@@ -209,6 +210,13 @@ void ReticuleM::initReticulum() {
         udpInterface.mode(RNS::Type::Interface::MODE_GATEWAY);
         RNS::Transport::register_interface(udpInterface);
         udpInterface.start();
+
+        // LoRa interface — Cap LoRa-1262 (U214) on EXT 2.54-14P
+        loraImpl = std::make_unique<LoRaInterface>("lora0");
+        loraInterface = RNS::Interface(loraImpl.get());
+        loraInterface.mode(RNS::Type::Interface::MODE_GATEWAY);
+        RNS::Transport::register_interface(loraInterface);
+        loraInterface.start();
         
         // Reticulum instance
         reticulum = RNS::Reticulum();

@@ -168,6 +168,10 @@ private:
     // UDP interface wrapper + impl pointer (for credential setup)
     RNS::Interface udpInterface{RNS::Type::NONE};
     std::unique_ptr<CardputerUDPInterface> udpImpl;
+
+    // LoRa interface — Cap LoRa-1262 (U214) on EXT 2.54-14P header
+    RNS::Interface loraInterface{RNS::Type::NONE};
+    std::unique_ptr<LoRaInterface> loraImpl;
     
     // ---- Status info ----
     bool wifiConnected;

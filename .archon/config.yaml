@@ -1,0 +1,18 @@
+# Archon Project Configuration for reticulem-cardputer
+# See: https://archon.diy/reference/configuration/
+
+# AI assistant for this project
+assistant: pi
+
+# Assistant defaults (override global)
+assistants:
+  pi:
+    model: openrouter/deepseek/deepseek-v3.2
+
+# Worktree settings — branch is master, not main
+worktree:
+  baseBranch: master
+
+# Commands configuration
+commands:
+  autoLoad: true
