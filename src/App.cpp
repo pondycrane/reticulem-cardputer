@@ -40,14 +40,9 @@ ReticuleM::ReticuleM()
       lastState(AppState::SPLASH),
       stateChanged(true),
       udpInterface(nullptr),
-      keyPressed(false),
-      lastChar(0),
-      fnDown(false),
-      ctrlDown(false),
-      cursorPos(0),
-      messageCount(0),
+      keyboard(),
+      messageStore(),
       messageSelected(0),
-      contactCount(0),
       contactSelected(0),
       composeField(0),
       lastBlink(0),
@@ -62,7 +57,6 @@ ReticuleM::ReticuleM()
       loraRSSI(NAN),
       loraSNR(NAN),
       peerCount(0),
-      nextMsgId(1),
       homeSelected(0),
       settingsSel(0),
       settingsEditing(false),
@@ -111,7 +105,7 @@ void ReticuleM::begin() {
 // ------------------------------------------------------------------
 void ReticuleM::update() {
     M5Cardputer.update();
-    processKeyboard();
+    keyboard.update();
     reticulumLoop();
 
     if (millis() - lastBlink > 500) {
@@ -383,34 +377,21 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
     const char* body = doc["b"] | "";
     
     // Add to inbox
-    if (messageCount < MAX_MESSAGES) {
+    if (messageStore.messageCount() < MessageStore::MAX_MESSAGES) {
         Message m{};
-        m.id = nextMsgId++;
+        m.id = messageStore.getNextMessageId();
         m.timestamp = millis();
         strlcpy(m.sender, from, sizeof(m.sender));
         strlcpy(m.recipient, ownHash, sizeof(m.recipient));
         strlcpy(m.content, body, sizeof(m.content));
         m.outgoing = false;
         m.read = false;
-        messages[messageCount++] = m;
+        messageStore.addMessage(m);
     }
     
     // Auto-add/update contact
     if (strlen(name) > 0) {
-        bool found = false;
-        for (int i = 0; i < contactCount; i++) {
-            if (strcmp(contacts[i].hash, from) == 0) {
-                strlcpy(contacts[i].name, name, sizeof(contacts[i].name));
-                found = true;
-                break;
-            }
-        }
-        if (!found && contactCount < MAX_CONTACTS) {
-            Contact c{};
-            strlcpy(c.name, name, sizeof(c.name));
-            strlcpy(c.hash, from, sizeof(c.hash));
-            contacts[contactCount++] = c;
-        }
+        messageStore.addOrUpdateContact(from, name, RNS::Bytes());
     }
     
     INFOF("Received msg from %s", from);
@@ -425,24 +406,11 @@ void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
     RNS::Bytes fullIdHash = announced_identity.hash();
     if (strlen(name) == 0 || strcmp(hash, ownHash) == 0) return;
     
-    bool found = false;
-    for (int i = 0; i < contactCount; i++) {
-        if (strcmp(contacts[i].hash, hash) == 0) {
-            strlcpy(contacts[i].name, name, sizeof(contacts[i].name));
-            contacts[i].fullHash = fullIdHash;
-            found = true;
-            break;
-        }
-    }
-    if (!found && contactCount < MAX_CONTACTS) {
-        Contact c{};
-        strlcpy(c.name, name, sizeof(c.name));
-        strlcpy(c.hash, hash, sizeof(c.hash));
-        c.fullHash = fullIdHash;
-        contacts[contactCount++] = c;
-        INFOF("New contact: %s (%s)", name, hash);
-    }
+    messageStore.addOrUpdateContact(hash, name, fullIdHash);
+    INFOF("New contact: %s (%s)", name, hash);
 }
+
+// ------------------------------------------------------------------
 
 // ------------------------------------------------------------------
 // Message Sending
@@ -473,16 +441,16 @@ void ReticuleM::sendNativeMessage(const char* recipient_hex, const char* body) {
     }
     
     // Add to local sent box
-    if (messageCount < MAX_MESSAGES) {
+    if (messageStore.messageCount() < MessageStore::MAX_MESSAGES) {
         Message m{};
-        m.id = nextMsgId++;
+        m.id = messageStore.getNextMessageId();
         m.timestamp = millis();
         strlcpy(m.sender, ownHash, sizeof(m.sender));
         strlcpy(m.recipient, hex_clean, sizeof(m.recipient));
         strlcpy(m.content, body, sizeof(m.content));
         m.outgoing = true;
         m.read = true;
-        messages[messageCount++] = m;
+        messageStore.addMessage(m);
     }
     
     if (!RNS::Transport::has_path(hash)) {
@@ -503,13 +471,9 @@ void ReticuleM::doSendNativeMessage(const RNS::Bytes& hash, const char* body) {
     // Look up the full identity hash from contacts (truncated hash won't work for recall)
     RNS::Bytes recallHash = hash;
     std::string hexHash = hash.toHex();
-    for (int i = 0; i < contactCount; i++) {
-        if (hexHash == std::string(contacts[i].hash)) {
-            if (contacts[i].fullHash.size() > 0) {
-                recallHash = contacts[i].fullHash;
-            }
-            break;
-        }
+    const Contact* contact = messageStore.findContactByHash(hexHash.c_str());
+    if (contact && contact->fullHash.size() > 0) {
+        recallHash = contact->fullHash;
     }
     
     RNS::Identity recipient_identity = RNS::Identity::recall(recallHash);
@@ -581,10 +545,10 @@ void ReticuleM::renderSplash() {
     clearScreen(TFT_BLACK);
     M5Cardputer.Display.setTextColor(TFT_GREEN);
     M5Cardputer.Display.setTextDatum(middle_center);
-    M5Cardputer.Display.setTextFont(&fonts::FreeMonoBold12pt7b);
+    M5Cardputer.Display.setFont(&fonts::FreeMonoBold12pt7b);
     M5Cardputer.Display.drawString("ReticuleM",
         SCREEN_W / 2, SCREEN_H / 2 - 20);
-    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
     M5Cardputer.Display.setTextColor(TFT_LIGHTGREY);
     M5Cardputer.Display.drawString("microReticulum",
         SCREEN_W / 2, SCREEN_H / 2 + 8);
@@ -615,14 +579,14 @@ void ReticuleM::runHome() {
         dirty = false;
     }
 
-    if (keyPressed) {
-        if (lastChar == '2' || lastChar == KEY_DOWN) {
+    if (keyboard.keyPressed()) {
+        if (keyboard.lastChar() == '2' || keyboard.lastChar() == KEY_DOWN) {
             homeSelected = (homeSelected + 1) % count;
             dirty = true;
-        } else if (lastChar == '8' || lastChar == KEY_UP) {
+        } else if (keyboard.lastChar() == '8' || keyboard.lastChar() == KEY_UP) {
             homeSelected = (homeSelected - 1 + count) % count;
             dirty = true;
-        } else if (lastChar == KEY_ENTER) {
+        } else if (keyboard.lastChar() == KEY_ENTER) {
             switch (homeSelected) {
                 case 0: state = AppState::INBOX; messageSelected = 0; dirty = true; break;
                 case 1: state = AppState::COMPOSE; composeField = 0;
@@ -634,7 +598,7 @@ void ReticuleM::runHome() {
                 case 4: state = AppState::STATUS; dirty = true; break;
             }
             return;
-        } else if (fnDown && lastChar == 'c') {
+        } else if (keyboard.fnDown() && keyboard.lastChar() == 'c') {
             state = AppState::COMPOSE;
             composeField = 0;
             memset(composeTo, 0, sizeof(composeTo));
@@ -660,25 +624,25 @@ void ReticuleM::runInbox() {
         dirty = false;
     }
 
-    if (keyPressed) {
-        if (lastChar == '2' || lastChar == KEY_DOWN) {
-            if (messageSelected < messageCount - 1) { messageSelected++; dirty = true; }
-        } else if (lastChar == '8' || lastChar == KEY_UP) {
+    if (keyboard.keyPressed()) {
+        if (keyboard.lastChar() == '2' || keyboard.lastChar() == KEY_DOWN) {
+            if (messageSelected < messageStore.messageCount() - 1) { messageSelected++; dirty = true; }
+        } else if (keyboard.lastChar() == '8' || keyboard.lastChar() == KEY_UP) {
             if (messageSelected > 0) { messageSelected--; dirty = true; }
-        } else if (lastChar == KEY_ENTER) {
-            if (messageCount > 0 && messageSelected < messageCount) {
-                messages[messageSelected].read = true;
+        } else if (keyboard.lastChar() == KEY_ENTER) {
+            if (messageStore.messageCount() > 0 && messageSelected < messageStore.messageCount()) {
+                messageStore.markMessageRead(messageSelected);
                 clearScreen();
                 drawHeader("Message");
-                M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+                M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
                 M5Cardputer.Display.setTextDatum(top_left);
                 M5Cardputer.Display.setTextColor(TFT_WHITE);
                 int y = 16;
-                M5Cardputer.Display.drawString(String("From: ") + messages[messageSelected].sender, 2, y);
+                M5Cardputer.Display.drawString(String("From: ") + messageStore.getMessage(messageSelected).sender, 2, y);
                 y += 12;
-                M5Cardputer.Display.drawString(String("To: ") + messages[messageSelected].recipient, 2, y);
+                M5Cardputer.Display.drawString(String("To: ") + messageStore.getMessage(messageSelected).recipient, 2, y);
                 y += 16;
-                String body = messages[messageSelected].content;
+                String body = messageStore.getMessage(messageSelected).content;
                 std::vector<String> lines;
                 wrapText(body, SCREEN_W - 4, lines);
                 for (const String& line : lines) {
@@ -689,25 +653,22 @@ void ReticuleM::runInbox() {
                 drawFooter("Any key to return");
                 // Wait for any key to return
                 dirty = true;
-                keyPressed = false;
+                keyboard.clearKeyPress();
             }
-        } else if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
-            if (messageCount > 0 && messageSelected < messageCount) {
-                for (int i = messageSelected; i < messageCount - 1; i++) {
-                    messages[i] = messages[i + 1];
-                }
-                messageCount--;
-                if (messageSelected >= messageCount && messageSelected > 0) messageSelected--;
+        } else if (keyboard.lastChar() == KEY_BACKSPACE || keyboard.lastChar() == KEY_DEL) {
+            if (messageStore.messageCount() > 0 && messageSelected < messageStore.messageCount()) {
+                messageStore.removeMessage(messageSelected);
+                if (messageSelected >= messageStore.messageCount() && messageSelected > 0) messageSelected--;
                 dirty = true;
             }
-        } else if (lastChar == KEY_ESC) {
+        } else if (keyboard.lastChar() == KEY_ESC) {
             state = AppState::HOME;
             dirty = true;
             return;
         } else {
             // Returning from detail view
             dirty = true;
-            keyPressed = false;
+            keyboard.clearKeyPress();
             return;
         }
     }
@@ -730,7 +691,7 @@ void ReticuleM::runCompose() {
     if (dirty) {
         clearScreen();
         drawHeader("Compose");
-        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
         M5Cardputer.Display.setTextDatum(top_left);
 
         int y = 16;
@@ -763,14 +724,14 @@ void ReticuleM::runCompose() {
         dirty = false;
     }
 
-    if (keyPressed) {
-        if (lastChar == KEY_ESC) {
+    if (keyboard.keyPressed()) {
+        if (keyboard.lastChar() == KEY_ESC) {
             state = AppState::HOME;
             dirty = true;
             return;
         }
 
-        if (fnDown && lastChar == KEY_ENTER) {
+        if (keyboard.fnDown() && keyboard.lastChar() == KEY_ENTER) {
             if (strlen(composeTo) > 0 && strlen(composeBody) > 0) {
                 sendNativeMessage(composeTo, composeBody);
             }
@@ -779,27 +740,27 @@ void ReticuleM::runCompose() {
             return;
         }
 
-        if (lastChar == KEY_TAB) {
+        if (keyboard.lastChar() == KEY_TAB) {
             composeField = (composeField + 1) % 2;
             dirty = true;
             return;
         }
 
-        if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
+        if (keyboard.lastChar() == KEY_BACKSPACE || keyboard.lastChar() == KEY_DEL) {
             if (composeField == 0 && strlen(composeTo) > 0) {
                 composeTo[strlen(composeTo) - 1] = '\0';
             } else if (composeField == 1 && strlen(composeBody) > 0) {
                 composeBody[strlen(composeBody) - 1] = '\0';
             }
             dirty = true;
-        } else if (lastChar >= 32 && lastChar < 127) {
+        } else if (keyboard.lastChar() >= 32 && keyboard.lastChar() < 127) {
             if (composeField == 0 && strlen(composeTo) < sizeof(composeTo) - 1) {
                 size_t len = strlen(composeTo);
-                composeTo[len] = lastChar;
+                composeTo[len] = keyboard.lastChar();
                 composeTo[len + 1] = '\0';
             } else if (composeField == 1 && strlen(composeBody) < sizeof(composeBody) - 1) {
                 size_t len = strlen(composeBody);
-                composeBody[len] = lastChar;
+                composeBody[len] = keyboard.lastChar();
                 composeBody[len + 1] = '\0';
             }
             dirty = true;
@@ -817,15 +778,15 @@ void ReticuleM::runContacts() {
     if (dirty) {
         clearScreen();
         drawHeader("Contacts");
-        if (contactCount == 0) {
-            M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        if (messageStore.contactCount() == 0) {
+            M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
             M5Cardputer.Display.setTextDatum(middle_center);
             M5Cardputer.Display.setTextColor(TFT_DARKGREY);
             M5Cardputer.Display.drawString("No contacts", SCREEN_W / 2, SCREEN_H / 2);
         } else {
             const int lineHeight = 13;
             int start = max(0, contactSelected - 8);
-            for (int i = start; i < contactCount && (i - start) < 9; i++) {
+            for (int i = start; i < messageStore.contactCount() && (i - start) < 9; i++) {
                 int y = 16 + (i - start) * lineHeight;
                 if (i == contactSelected) {
                     M5Cardputer.Display.fillRect(0, y, SCREEN_W, lineHeight, TFT_DARKCYAN);
@@ -833,10 +794,10 @@ void ReticuleM::runContacts() {
                 } else {
                     M5Cardputer.Display.setTextColor(TFT_WHITE);
                 }
-                M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+                M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
                 M5Cardputer.Display.setTextDatum(top_left);
                 char lineBuf[48];
-                snprintf(lineBuf, sizeof(lineBuf), "%s %.12s...", contacts[i].name, contacts[i].hash);
+                snprintf(lineBuf, sizeof(lineBuf), "%s %.12s...", messageStore.getContact(i).name, messageStore.getContact(i).hash);
                 M5Cardputer.Display.drawString(lineBuf, 2, y);
             }
         }
@@ -844,19 +805,19 @@ void ReticuleM::runContacts() {
         dirty = false;
     }
 
-    if (keyPressed) {
-        if (lastChar == KEY_ESC) {
+    if (keyboard.keyPressed()) {
+        if (keyboard.lastChar() == KEY_ESC) {
             state = AppState::HOME;
             dirty = true;
             return;
         }
-        if (lastChar == '2' || lastChar == KEY_DOWN) {
-            if (contactSelected < contactCount - 1) { contactSelected++; dirty = true; }
-        } else if (lastChar == '8' || lastChar == KEY_UP) {
+        if (keyboard.lastChar() == '2' || keyboard.lastChar() == KEY_DOWN) {
+            if (contactSelected < messageStore.contactCount() - 1) { contactSelected++; dirty = true; }
+        } else if (keyboard.lastChar() == '8' || keyboard.lastChar() == KEY_UP) {
             if (contactSelected > 0) { contactSelected--; dirty = true; }
-        } else if (lastChar == KEY_ENTER) {
-            if (contactCount > 0 && contactSelected < contactCount) {
-                strncpy(composeTo, contacts[contactSelected].hash, sizeof(composeTo) - 1);
+        } else if (keyboard.lastChar() == KEY_ENTER) {
+            if (messageStore.contactCount() > 0 && contactSelected < messageStore.contactCount()) {
+                strncpy(composeTo, messageStore.getContact(contactSelected).hash, sizeof(composeTo) - 1);
                 state = AppState::COMPOSE;
                 composeField = 1;
                 dirty = true;
@@ -884,7 +845,7 @@ void ReticuleM::runSettings() {
     if (dirty) {
         clearScreen();
         drawHeader("Settings");
-        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
         M5Cardputer.Display.setTextDatum(top_left);
 
         for (int i = 0; i < scount; i++) {
@@ -917,21 +878,21 @@ void ReticuleM::runSettings() {
         dirty = false;
     }
 
-    if (keyPressed) {
-        if (lastChar == KEY_ESC) {
+    if (keyboard.keyPressed()) {
+        if (keyboard.lastChar() == KEY_ESC) {
             state = AppState::HOME;
             dirty = true;
             return;
         }
 
         if (!settingsEditing) {
-            if (lastChar == '2' || lastChar == KEY_DOWN) {
+            if (keyboard.lastChar() == '2' || keyboard.lastChar() == KEY_DOWN) {
                 settingsSel = (settingsSel + 1) % scount;
                 dirty = true;
-            } else if (lastChar == '8' || lastChar == KEY_UP) {
+            } else if (keyboard.lastChar() == '8' || keyboard.lastChar() == KEY_UP) {
                 settingsSel = (settingsSel - 1 + scount) % scount;
                 dirty = true;
-            } else if (lastChar == KEY_ENTER) {
+            } else if (keyboard.lastChar() == KEY_ENTER) {
                 if (settingsSel == 3) {
                     transportEnabled = !transportEnabled;
                     reticulum.transport_enabled(transportEnabled);
@@ -960,19 +921,19 @@ void ReticuleM::runSettings() {
                 dirty = true;
             }
         } else {
-            if (lastChar == KEY_ENTER) {
+            if (keyboard.lastChar() == KEY_ENTER) {
                 settingsEditing = false;
                 settingsEditTarget = nullptr;
                 dirty = true;
-            } else if (lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) {
+            } else if (keyboard.lastChar() == KEY_BACKSPACE || keyboard.lastChar() == KEY_DEL) {
                 if (settingsEditTarget && strlen(settingsEditTarget) > 0) {
                     settingsEditTarget[strlen(settingsEditTarget) - 1] = '\0';
                     dirty = true;
                 }
-            } else if (lastChar >= 32 && lastChar < 127 && settingsEditTarget) {
+            } else if (keyboard.lastChar() >= 32 && keyboard.lastChar() < 127 && settingsEditTarget) {
                 if (strlen(settingsEditTarget) < settingsEditMax) {
                     size_t len = strlen(settingsEditTarget);
-                    settingsEditTarget[len] = lastChar;
+                    settingsEditTarget[len] = keyboard.lastChar();
                     settingsEditTarget[len + 1] = '\0';
                     dirty = true;
                 }
@@ -990,7 +951,7 @@ void ReticuleM::runStatus() {
     if (dirty) {
         clearScreen();
         drawHeader("Status");
-        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
         M5Cardputer.Display.setTextDatum(top_left);
         M5Cardputer.Display.setTextColor(TFT_WHITE);
         int y = 16;
@@ -1020,10 +981,10 @@ void ReticuleM::runStatus() {
         snprintf(lineBuf, sizeof(lineBuf), "Hash:  %.28s", ownHash);
         M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        snprintf(lineBuf, sizeof(lineBuf), "Msgs:  %d/%d", messageCount, MAX_MESSAGES);
+        snprintf(lineBuf, sizeof(lineBuf), "Msgs:  %d/%d", messageStore.messageCount(), MessageStore::MAX_MESSAGES);
         M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
-        snprintf(lineBuf, sizeof(lineBuf), "Contacts: %d", contactCount);
+        snprintf(lineBuf, sizeof(lineBuf), "Contacts: %d", messageStore.contactCount());
         M5Cardputer.Display.drawString(lineBuf, 2, y);
         y += 14;
         snprintf(lineBuf, sizeof(lineBuf), "Status: %s", nodeStatus);
@@ -1035,7 +996,7 @@ void ReticuleM::runStatus() {
         drawFooter("`=Esc");
         dirty = false;
     }
-    if (keyPressed && (lastChar == KEY_ESC)) {
+    if (keyboard.keyPressed() && (keyboard.lastChar() == KEY_ESC)) {
         state = AppState::HOME;
         dirty = true;
     }
@@ -1044,63 +1005,7 @@ void ReticuleM::runStatus() {
 // ------------------------------------------------------------------
 // Keyboard Processing
 // ------------------------------------------------------------------
-void ReticuleM::processKeyboard() {
-    keyPressed = false;
-    lastChar = 0;
 
-    if (!M5Cardputer.Keyboard.isChange()) return;
-    if (!M5Cardputer.Keyboard.isPressed()) return;
-
-    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
-    fnDown = status.fn;
-    ctrlDown = status.ctrl;
-
-    // Special flags already decoded by library
-    if (status.del) { keyPressed = true; lastChar = KEY_BACKSPACE; }
-    if (status.enter) { keyPressed = true; lastChar = KEY_ENTER; }
-    if (status.tab) { keyPressed = true; lastChar = KEY_TAB; }
-    if (status.space) { keyPressed = true; lastChar = ' '; }
-
-    // Map raw physical positions to semantic keys (Cardputer ADV layout)
-    for (auto keyPos : M5Cardputer.Keyboard.keyList()) {
-        // Skip modifier positions
-        if ((keyPos.x == 0 && keyPos.y == 2) ||  // FN
-            (keyPos.x == 1 && keyPos.y == 2) ||  // SHIFT
-            (keyPos.x == 0 && keyPos.y == 3) ||  // CTRL
-            (keyPos.x == 1 && keyPos.y == 3) ||  // OPT
-            (keyPos.x == 2 && keyPos.y == 3)) {   // ALT
-            continue;
-        }
-
-        // Dedicated arrow keys (physical positions on ADV keyboard)
-        if (keyPos.x == 11 && keyPos.y == 2) { lastChar = KEY_UP; keyPressed = true; }
-        else if (keyPos.x == 11 && keyPos.y == 3) { lastChar = KEY_DOWN; keyPressed = true; }
-        else if (keyPos.x == 10 && keyPos.y == 3) { lastChar = KEY_LEFT; keyPressed = true; }
-        else if (keyPos.x == 12 && keyPos.y == 3) { lastChar = KEY_RIGHT; keyPressed = true; }
-        // ESC key (top-left physical key, labeled ` or ~)
-        else if (keyPos.x == 0 && keyPos.y == 0) { lastChar = KEY_ESC; keyPressed = true; }
-        // Enter and Backspace are already covered by status flags, but map anyway
-        else if (keyPos.x == 13 && keyPos.y == 2) { lastChar = KEY_ENTER; keyPressed = true; }
-        else if (keyPos.x == 13 && keyPos.y == 0) { lastChar = KEY_BACKSPACE; keyPressed = true; }
-        else {
-            // Regular printable character
-            auto kv = M5Cardputer.Keyboard.getKeyValue(keyPos);
-            if (status.shift || status.ctrl || M5Cardputer.Keyboard.capslocked()) {
-                lastChar = kv.value_second;
-            } else {
-                lastChar = kv.value_first;
-            }
-            keyPressed = true;
-        }
-        break; // only act on first non-modifier key per frame
-    }
-
-    if (keyPressed && lastChar >= 32 && lastChar < 127) {
-        cursorPos++;
-    } else if ((lastChar == KEY_BACKSPACE || lastChar == KEY_DEL) && cursorPos > 0) {
-        cursorPos--;
-    }
-}
 
 // ------------------------------------------------------------------
 // wrapText — pixel-exact line breaking
@@ -1109,7 +1014,7 @@ void ReticuleM::wrapText(const String& text, int maxPixelWidth, std::vector<Stri
     lines.clear();
     if (text.length() == 0) return;
 
-    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
 
     int start = 0;
     const int len = text.length();
@@ -1139,7 +1044,7 @@ void ReticuleM::clearScreen(uint16_t color) {
 
 void ReticuleM::drawHeader(const char* title) {
     M5Cardputer.Display.fillRect(0, 0, SCREEN_W, 14, TFT_NAVY);
-    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
     M5Cardputer.Display.setTextDatum(middle_left);
     M5Cardputer.Display.setTextColor(TFT_WHITE);
     M5Cardputer.Display.drawString(title, 4, 7);
@@ -1147,7 +1052,7 @@ void ReticuleM::drawHeader(const char* title) {
 
 void ReticuleM::drawFooter(const char* hint) {
     M5Cardputer.Display.fillRect(0, SCREEN_H - 12, SCREEN_W, 12, TFT_DARKGREY);
-    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
     M5Cardputer.Display.setTextDatum(middle_left);
     M5Cardputer.Display.setTextColor(TFT_WHITE);
     M5Cardputer.Display.drawString(hint, 2, SCREEN_H - 6);
@@ -1168,7 +1073,7 @@ void ReticuleM::drawStatusBar() {
 void ReticuleM::drawMenu(const char** items, int count, int selected) {
     const int lineHeight = 13;
     int startY = 18;
-    M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
     for (int i = 0; i < count; i++) {
         int y = startY + i * lineHeight;
         if (i == selected) {
@@ -1183,8 +1088,8 @@ void ReticuleM::drawMenu(const char** items, int count, int selected) {
 }
 
 void ReticuleM::drawMessageList() {
-    if (messageCount == 0) {
-        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+    if (messageStore.messageCount() == 0) {
+        M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
         M5Cardputer.Display.setTextDatum(middle_center);
         M5Cardputer.Display.setTextColor(TFT_DARKGREY);
         M5Cardputer.Display.drawString("No messages", SCREEN_W / 2, SCREEN_H / 2);
@@ -1192,9 +1097,9 @@ void ReticuleM::drawMessageList() {
     }
     const int lineHeight = 13;
     int start = max(0, messageSelected - 7);
-    for (int i = start; i < messageCount && (i - start) < 9; i++) {
+    for (int i = start; i < messageStore.messageCount() && (i - start) < 9; i++) {
         int y = 16 + (i - start) * lineHeight;
-        Message m = messages[i];
+        Message m = messageStore.getMessage(i);
         bool active = (i == messageSelected);
         if (active) {
             M5Cardputer.Display.fillRect(0, y, SCREEN_W, lineHeight, TFT_DARKCYAN);
@@ -1202,7 +1107,7 @@ void ReticuleM::drawMessageList() {
         } else {
             M5Cardputer.Display.setTextColor(m.read ? TFT_LIGHTGREY : TFT_WHITE);
         }
-        M5Cardputer.Display.setTextFont(&fonts::FreeMono9pt7b);
+        M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
         M5Cardputer.Display.setTextDatum(top_left);
         char lineBuf[48];
         const char* prefix = m.outgoing ? ">" : (m.read ? " " : "*");
