@@ -409,7 +409,8 @@ void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
     messageStore.addOrUpdateContact(hash, name, fullIdHash);
     INFOF("New contact: %s (%s)", name, hash);
 }
-}
+
+// ------------------------------------------------------------------
 
 // ------------------------------------------------------------------
 // Message Sending
@@ -630,18 +631,18 @@ void ReticuleM::runInbox() {
             if (messageSelected > 0) { messageSelected--; dirty = true; }
         } else if (keyboard.lastChar() == KEY_ENTER) {
             if (messageStore.messageCount() > 0 && messageSelected < messageStore.messageCount()) {
-                messageStore.getMessage(messageSelected].read = true;
+                messageStore.markMessageRead(messageSelected);
                 clearScreen();
                 drawHeader("Message");
                 M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
                 M5Cardputer.Display.setTextDatum(top_left);
                 M5Cardputer.Display.setTextColor(TFT_WHITE);
                 int y = 16;
-                M5Cardputer.Display.drawString(String("From: ") + messageStore.getMessage(messageSelected].sender, 2, y);
+                M5Cardputer.Display.drawString(String("From: ") + messageStore.getMessage(messageSelected).sender, 2, y);
                 y += 12;
-                M5Cardputer.Display.drawString(String("To: ") + messageStore.getMessage(messageSelected].recipient, 2, y);
+                M5Cardputer.Display.drawString(String("To: ") + messageStore.getMessage(messageSelected).recipient, 2, y);
                 y += 16;
-                String body = messageStore.getMessage(messageSelected].content;
+                String body = messageStore.getMessage(messageSelected).content;
                 std::vector<String> lines;
                 wrapText(body, SCREEN_W - 4, lines);
                 for (const String& line : lines) {
@@ -656,10 +657,7 @@ void ReticuleM::runInbox() {
             }
         } else if (keyboard.lastChar() == KEY_BACKSPACE || keyboard.lastChar() == KEY_DEL) {
             if (messageStore.messageCount() > 0 && messageSelected < messageStore.messageCount()) {
-                for (int i = messageSelected; i < messageStore.messageCount() - 1; i++) {
-                    messageStore.getMessage(i] = messageStore.getMessage(i + 1];
-                }
-                messageStore.messageCount()--;
+                messageStore.removeMessage(messageSelected);
                 if (messageSelected >= messageStore.messageCount() && messageSelected > 0) messageSelected--;
                 dirty = true;
             }
@@ -799,7 +797,7 @@ void ReticuleM::runContacts() {
                 M5Cardputer.Display.setFont(&fonts::FreeMono9pt7b);
                 M5Cardputer.Display.setTextDatum(top_left);
                 char lineBuf[48];
-                snprintf(lineBuf, sizeof(lineBuf), "%s %.12s...", messageStore.getContact(i].name, messageStore.getContact(i].hash);
+                snprintf(lineBuf, sizeof(lineBuf), "%s %.12s...", messageStore.getContact(i).name, messageStore.getContact(i).hash);
                 M5Cardputer.Display.drawString(lineBuf, 2, y);
             }
         }
@@ -819,7 +817,7 @@ void ReticuleM::runContacts() {
             if (contactSelected > 0) { contactSelected--; dirty = true; }
         } else if (keyboard.lastChar() == KEY_ENTER) {
             if (messageStore.contactCount() > 0 && contactSelected < messageStore.contactCount()) {
-                strncpy(composeTo, messageStore.getContact(contactSelected].hash, sizeof(composeTo) - 1);
+                strncpy(composeTo, messageStore.getContact(contactSelected).hash, sizeof(composeTo) - 1);
                 state = AppState::COMPOSE;
                 composeField = 1;
                 dirty = true;
@@ -1101,7 +1099,7 @@ void ReticuleM::drawMessageList() {
     int start = max(0, messageSelected - 7);
     for (int i = start; i < messageStore.messageCount() && (i - start) < 9; i++) {
         int y = 16 + (i - start) * lineHeight;
-        Message m = messageStore.getMessage(i];
+        Message m = messageStore.getMessage(i);
         bool active = (i == messageSelected);
         if (active) {
             M5Cardputer.Display.fillRect(0, y, SCREEN_W, lineHeight, TFT_DARKCYAN);
