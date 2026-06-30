@@ -506,8 +506,8 @@ bool verifySignature(const LXMessage& msg, const RNS::Identity& sourceIdentity) 
         // were signed. If MsgPack encoding is deterministic (it is for
         // our fixed-format messages), we can reconstruct them.
         //
-        // However, to keep things simple and reliable, we use the approach
-        // from unpackMessage where we stored the original offset.
+        // However, to keep things simple and reliable, we reconstruct
+        // the payload from parsed fields.
         //
         // For now, we reconstruct:
         //   dest_hash + src_hash + msgpack_payload = hashed_part
@@ -553,7 +553,7 @@ bool verifySignature(const LXMessage& msg, const RNS::Identity& sourceIdentity) 
             writeBin8(&mpData[pos], (const uint8_t*)msg.content.c_str(), (uint8_t)clen);
             pos += 2 + clen;
         } else {
-            uint16_t len16 = (uint16_t)(clen > 65535 ? 65535 : tlen);
+            uint16_t len16 = (uint16_t)(clen > 65535 ? 65535 : clen);
             writeBin16(&mpData[pos], (const uint8_t*)msg.content.c_str(), len16);
             pos += 3 + len16;
         }
@@ -586,9 +586,11 @@ bool verifySignature(const LXMessage& msg, const RNS::Identity& sourceIdentity) 
         return sourceIdentity.validate(msg.signature, signedPart);
     }
     catch (const std::exception& e) {
+        ERRORF("verifySignature exception: %s", e.what());
         return false;
     }
     catch (...) {
+        ERROR("verifySignature unknown exception");
         return false;
     }
 }
@@ -656,15 +658,33 @@ bool decodeAnnounceData(const RNS::Bytes& appData, char* nameOut, size_t nameOut
         size_t pos = 1;
 
         // Read first element: bin(displayName)
+        // Peek at the element tag before calling readBin, since
+        // readBin advances pos past the tag on failure, breaking
+        // the string-type fallback detection.
+        uint8_t elementTag = (pos < len) ? raw[pos] : 0;
         std::string dn;
         if (!readBin(raw, pos, len, dn)) {
             // Could also be a str instead of bin
-            // Try reading as string
-            if (pos >= len) return false;
-            uint8_t tag = raw[pos++];
-            if (tag >= 0xA0 && tag <= 0xBF) {
+            // Try reading as string (pos was NOT advanced if readBin
+            // consumed the tag — we use elementTag peeking instead)
+            if (elementTag >= 0xA0 && elementTag <= 0xBF) {
                 // fixstr
-                uint8_t slen = tag & 0x1F;
+                uint8_t slen = elementTag & 0x1F;
+                if (pos + slen > len) return false;
+                dn.assign((const char*)raw + pos, slen);
+                pos += slen;
+            } else if (elementTag == 0xD9) {
+                // str8
+                if (pos + 1 > len) return false;
+                uint8_t slen = raw[pos++];
+                if (pos + slen > len) return false;
+                dn.assign((const char*)raw + pos, slen);
+                pos += slen;
+            } else if (elementTag == 0xDA) {
+                // str16
+                if (pos + 2 > len) return false;
+                uint16_t slen = ((uint16_t)raw[pos] << 8) | raw[pos+1];
+                pos += 2;
                 if (pos + slen > len) return false;
                 dn.assign((const char*)raw + pos, slen);
                 pos += slen;

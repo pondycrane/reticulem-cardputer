@@ -2,7 +2,6 @@
 #define RETICULEM_LXMFCOMPAT_H
 
 #include <microReticulum.h>
-#include <MsgPack.h>
 #include <cstdint>
 #include <string>
 
@@ -80,7 +79,14 @@ bool unpackMessage(const RNS::Bytes& data, LXMessage& out);
 // Reconstructs the signed blob (hashed_part + message_hash) and calls
 // sourceIdentity.validate().
 //
-// @param msg                Parsed LXMessage (must have valid destHash, srcHash, signature)
+// NOTE: OPPORTUNISTIC messages (where destHash is empty) cannot be fully
+// verified because the destination hash is needed to reconstruct the signed
+// data. In those cases a zero-filled placeholder is used, but verification
+// will fail. Callers should check msg.destHash.size() and treat an empty
+// destHash as "not verifiable" rather than "invalid".
+//
+// @param msg                Parsed LXMessage; destHash may be empty for
+//                           OPPORTUNISTIC delivery (non-verifiable case)
 // @param sourceIdentity     RNS::Identity of the sender (recalled via RNS::Identity::recall)
 // @return                   true if signature is valid
 //

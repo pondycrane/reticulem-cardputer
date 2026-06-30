@@ -401,7 +401,14 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
         RNS::Identity sourceIdentity = RNS::Identity::recall(lxmfMsg.srcHash);
         if (sourceIdentity) {
             if (!LXMFCompat::verifySignature(lxmfMsg, sourceIdentity)) {
-                WARNING("LXMF signature verification failed — accepting message anyway");
+                // OPPORTUNISTIC messages have no dest hash and cannot
+                // be verified (zero-hash placeholder doesn't match original).
+                // Only warn for DIRECT delivery where verification should succeed.
+                if (lxmfMsg.destHash.size() > 0) {
+                    WARNING("LXMF signature verification failed — accepting message anyway");
+                } else {
+                    INFO("LXMF OPPORTUNISTIC message — signature not verifiable (no dest hash)");
+                }
             }
         } else {
             INFOF("LXMF message from unknown identity %s — signature not verified", from);
@@ -418,6 +425,8 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
             m.outgoing = false;
             m.read = false;
             messageStore.addMessage(m);
+        } else {
+            WARNING("Inbox full — dropping incoming LXMF message");
         }
         
         // Auto-add/update contact from source identity app_data
@@ -453,7 +462,7 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
     const char* name = doc["n"] | "";
     const char* body = doc["b"] | "";
     
-    // Add to inbox
+    // Add to inbox (JSON fallback path)
     if (messageStore.messageCount() < MessageStore::MAX_MESSAGES) {
         Message m{};
         m.id = messageStore.getNextMessageId();
@@ -464,6 +473,8 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
         m.outgoing = false;
         m.read = false;
         messageStore.addMessage(m);
+    } else {
+        WARNING("Inbox full — dropping incoming JSON message");
     }
     
     // Auto-add/update contact

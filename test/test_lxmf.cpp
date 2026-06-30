@@ -271,6 +271,60 @@ void test_utf8_content_roundtrip() {
 }
 
 // ------------------------------------------------------------------
+// Test: signature validation with content > 255 bytes (bin16 path)
+// Regression test for tlen-vs-clen copy-paste bug in verifySignature
+// ------------------------------------------------------------------
+void test_signature_validation_long_content() {
+    // Generate content > 255 bytes to exercise bin16 path
+    std::string content;
+    for (int i = 0; i < 280; i++) {
+        content += 'A' + (i % 26);
+    }
+    RNS::Bytes destHash = RNS::Identity::get_random_hash();
+    
+    // Pack with source identity (which has the private key)
+    RNS::Bytes packed = LXMFCompat::packMessage(g_testIdentity, destHash, "LongSig", content.c_str());
+    
+    // DIRECT format (with dest hash) — this is the format where
+    // verifySignature can reconstruct the full hashed_part
+    LXMFCompat::LXMessage msg;
+    bool ok = LXMFCompat::unpackMessage(packed, msg);
+    TEST_ASSERT_TRUE(ok);
+    
+    // Signature must verify — this catches the tlen/clen bug
+    bool sigOk = LXMFCompat::verifySignature(msg, g_testIdentity);
+    TEST_ASSERT_TRUE(sigOk);
+}
+
+// ------------------------------------------------------------------
+// Test: OPPORTUNISTIC signature verification (known limitation)
+// Documents that OPPORTUNISTIC messages cannot be verified because
+// the dest hash is missing from the payload.
+// ------------------------------------------------------------------
+void test_signature_validation_opportunistic() {
+    const char* content = "OPPORTUNISTIC message";
+    RNS::Bytes destHash = RNS::Identity::get_random_hash();
+    
+    RNS::Bytes packed = LXMFCompat::packMessage(g_testIdentity, destHash, "Test", content);
+    // Strip dest hash to simulate OPPORTUNISTIC delivery
+    RNS::Bytes oppPayload = packed.mid(LXMFCompat::DESTINATION_LENGTH);
+    
+    LXMFCompat::LXMessage msg;
+    bool ok = LXMFCompat::unpackMessage(oppPayload, msg);
+    TEST_ASSERT_TRUE(ok);
+    
+    // destHash should be empty (OPPORTUNISTIC format)
+    TEST_ASSERT_EQUAL(0, msg.destHash.size());
+    
+    // Signature verification will fail because dest hash is missing
+    // (zero-filled placeholder doesn't match original signed data)
+    // This is a known limitation — OPPORTUNISTIC messages cannot be
+    // fully verified without knowing the destination.
+    bool sigOk = LXMFCompat::verifySignature(msg, g_testIdentity);
+    TEST_ASSERT_FALSE(sigOk);
+}
+
+// ------------------------------------------------------------------
 // Test: long content (near 295-byte single-packet limit)
 // ------------------------------------------------------------------
 void test_long_content_roundtrip() {
@@ -306,6 +360,8 @@ void setup() {
     RUN_TEST(test_signature_validation_valid);
     RUN_TEST(test_signature_validation_tampered);
     RUN_TEST(test_signature_validation_wrong_identity);
+    RUN_TEST(test_signature_validation_long_content);
+    RUN_TEST(test_signature_validation_opportunistic);
     RUN_TEST(test_announce_data_roundtrip);
     RUN_TEST(test_announce_data_legacy_format);
     RUN_TEST(test_announce_data_empty);
