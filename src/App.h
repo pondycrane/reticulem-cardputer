@@ -144,7 +144,9 @@ private:
     RNS::Reticulum reticulum;
     RNS::Identity identity;
     RNS::Destination inboxDest{RNS::Type::NONE};
+    RNS::Destination lxmfDeliveryDest{RNS::Type::NONE};
     RNS::HAnnounceHandler announceHandler;
+    RNS::HAnnounceHandler lxmfAnnounceHandler;
     
     // UDP interface wrapper + impl pointer (for credential setup)
     RNS::Interface udpInterface{RNS::Type::NONE};

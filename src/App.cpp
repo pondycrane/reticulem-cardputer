@@ -1,4 +1,5 @@
 #include "App.h"
+#include "LXMFCompat.h"
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <LoRaInterface.h>
@@ -13,12 +14,23 @@ static void staticPacketCallback(const RNS::Bytes& data, const RNS::Packet& pack
 }
 
 // ------------------------------------------------------------------
-// ReticuleM Announce Handler subclass
+// ReticuleM Announce Handler subclasses
 // ------------------------------------------------------------------
 class ReticuleMAnnounceHandler : public RNS::AnnounceHandler {
 public:
     ReticuleM* app;
     ReticuleMAnnounceHandler(ReticuleM* a) : RNS::AnnounceHandler("reticulem.inbox"), app(a) {}
+    virtual void received_announce(const RNS::Bytes& destination_hash,
+                                   const RNS::Identity& announced_identity,
+                                   const RNS::Bytes& app_data) override {
+        if (app) app->onAnnounceReceived(destination_hash, announced_identity, app_data);
+    }
+};
+
+class LXMFAnnounceHandler : public RNS::AnnounceHandler {
+public:
+    ReticuleM* app;
+    LXMFAnnounceHandler(ReticuleM* a) : RNS::AnnounceHandler("lxmf.delivery"), app(a) {}
     virtual void received_announce(const RNS::Bytes& destination_hash,
                                    const RNS::Identity& announced_identity,
                                    const RNS::Bytes& app_data) override {
@@ -262,7 +274,7 @@ void ReticuleM::initReticulum() {
         strlcpy(ownHash, identity.hash().toHex().c_str(), sizeof(ownHash));
         INFOF("Identity loaded, hash: %s", ownHash);
         
-        // Inbox destination
+        // Inbox destination (legacy reticulem.inbox for backward compat)
         inboxDest = RNS::Destination(
             identity,
             RNS::Type::Destination::IN,
@@ -274,9 +286,23 @@ void ReticuleM::initReticulum() {
         inboxDest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
         INFOF("Inbox destination: %s", inboxDest.hash().toHex().c_str());
         
-        // Announce handler
+        // LXMF delivery destination (Sideband-compatible)
+        lxmfDeliveryDest = RNS::Destination(
+            identity,
+            RNS::Type::Destination::IN,
+            RNS::Type::Destination::SINGLE,
+            LXMFCompat::APP_NAME,
+            LXMFCompat::DELIVERY_ASPECT
+        );
+        lxmfDeliveryDest.set_packet_callback(staticPacketCallback);
+        lxmfDeliveryDest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
+        INFOF("LXMF delivery destination: %s", lxmfDeliveryDest.hash().toHex().c_str());
+        
+        // Announce handlers — dual aspect for backward compat during transition
         announceHandler = RNS::HAnnounceHandler(new ReticuleMAnnounceHandler(this));
         RNS::Transport::register_announce_handler(announceHandler);
+        lxmfAnnounceHandler = RNS::HAnnounceHandler(new LXMFAnnounceHandler(this));
+        RNS::Transport::register_announce_handler(lxmfAnnounceHandler);
         
         // Initial announce
         performAnnounce();
@@ -346,10 +372,17 @@ void ReticuleM::saveIdentity() {
 }
 
 void ReticuleM::performAnnounce() {
+    // Announce legacy reticulem.inbox (plain UTF-8 display name)
     if (inboxDest) {
         RNS::Bytes app_data(displayName);
         inboxDest.announce(app_data);
         INFO("Announced reticulem.inbox");
+    }
+    // Announce LXMF lxmf.delivery (MsgPack-encoded app_data)
+    if (lxmfDeliveryDest) {
+        RNS::Bytes lxmfAppData = LXMFCompat::encodeAnnounceData(displayName);
+        lxmfDeliveryDest.announce(lxmfAppData);
+        INFO("Announced lxmf.delivery");
     }
 }
 
@@ -357,7 +390,51 @@ void ReticuleM::performAnnounce() {
 // Message Receiving
 // ------------------------------------------------------------------
 void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& packet) {
-    // Parse JSON payload
+    // ---- Try LXMF format first (Sideband / LXMF-compatible clients) ----
+    LXMFCompat::LXMessage lxmfMsg;
+    if (LXMFCompat::unpackMessage(data, lxmfMsg)) {
+        std::string srcHashHex = lxmfMsg.srcHash.toHex();
+        const char* from = srcHashHex.c_str();
+        const char* body = lxmfMsg.content.c_str();
+        
+        // Try to verify signature if source identity is known
+        RNS::Identity sourceIdentity = RNS::Identity::recall(lxmfMsg.srcHash);
+        if (sourceIdentity) {
+            if (!LXMFCompat::verifySignature(lxmfMsg, sourceIdentity)) {
+                WARNING("LXMF signature verification failed — accepting message anyway");
+            }
+        } else {
+            INFOF("LXMF message from unknown identity %s — signature not verified", from);
+        }
+        
+        // Add to inbox
+        if (messageStore.messageCount() < MessageStore::MAX_MESSAGES) {
+            Message m{};
+            m.id = messageStore.getNextMessageId();
+            m.timestamp = millis();
+            strlcpy(m.sender, from, sizeof(m.sender));
+            strlcpy(m.recipient, ownHash, sizeof(m.recipient));
+            strlcpy(m.content, body, sizeof(m.content));
+            m.outgoing = false;
+            m.read = false;
+            messageStore.addMessage(m);
+        }
+        
+        // Auto-add/update contact from source identity app_data
+        if (sourceIdentity) {
+            RNS::Bytes contactAppData = sourceIdentity.app_data();
+            char contactName[64];
+            if (LXMFCompat::decodeAnnounceData(contactAppData, contactName, sizeof(contactName))
+                && contactName[0] != '\0') {
+                messageStore.addOrUpdateContact(from, contactName, RNS::Bytes());
+            }
+        }
+        
+        INFOF("Received LXMF msg from %s", from);
+        return;
+    }
+    
+    // ---- Fallback: legacy JSON payload (reticulem.inbox) ----
     String json = data.toString().c_str();
     StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, json);
@@ -400,14 +477,30 @@ void ReticuleM::onPacketReceived(const RNS::Bytes& data, const RNS::Packet& pack
 void ReticuleM::onAnnounceReceived(const RNS::Bytes& destination_hash,
                                    const RNS::Identity& announced_identity,
                                    const RNS::Bytes& app_data) {
-    const char* name = app_data.toString().c_str();
     const char* hash = destination_hash.toHex().c_str();
+    // Skip own announces
+    if (strcmp(hash, ownHash) == 0) return;
+    
+    // Try LXMF MsgPack-encoded app_data first (Sideband-compatible)
+    char decodedName[64];
+    bool gotName = LXMFCompat::decodeAnnounceData(app_data, decodedName, sizeof(decodedName));
+    
+    // Fall back to legacy plain-UTF-8 format
+    if (!gotName || decodedName[0] == '\0') {
+        const char* legacyName = app_data.toString().c_str();
+        if (strlen(legacyName) > 0) {
+            strlcpy(decodedName, legacyName, sizeof(decodedName));
+            gotName = true;
+        }
+    }
+    
+    if (!gotName || decodedName[0] == '\0') return;
+    
     // Store the full 32-byte identity hash for Identity::recall()
     RNS::Bytes fullIdHash = announced_identity.hash();
-    if (strlen(name) == 0 || strcmp(hash, ownHash) == 0) return;
     
-    messageStore.addOrUpdateContact(hash, name, fullIdHash);
-    INFOF("New contact: %s (%s)", name, hash);
+    messageStore.addOrUpdateContact(hash, decodedName, fullIdHash);
+    INFOF("New contact: %s (%s)", decodedName, hash);
 }
 
 // ------------------------------------------------------------------
@@ -483,30 +576,36 @@ void ReticuleM::doSendNativeMessage(const RNS::Bytes& hash, const char* body) {
         return;
     }
     
+    // ---- Send via LXMF (OPPORTUNISTIC delivery) ----
+    // Pack the message in LXMF wire format
+    RNS::Bytes lxmfPayload = LXMFCompat::packMessage(
+        identity,
+        recallHash,
+        "",       // title (empty for now)
+        body      // content
+    );
+    
+    // For OPPORTUNISTIC delivery, strip the destination hash from the
+    // front of the packed data since RNS routes by it already.
+    // The payload is: packed[LXMFCompat::DESTINATION_LENGTH:] = src_hash + signature + msgpack
+    RNS::Bytes packetPayload = lxmfPayload.mid(LXMFCompat::DESTINATION_LENGTH);
+    
     RNS::Destination recipient(
         recipient_identity,
         RNS::Type::Destination::OUT,
         RNS::Type::Destination::SINGLE,
-        "reticulem",
-        "inbox"
+        LXMFCompat::APP_NAME,
+        LXMFCompat::DELIVERY_ASPECT
     );
     
-    StaticJsonDocument<512> doc;
-    doc["v"] = 1;
-    doc["n"] = displayName;
-    doc["f"] = ownHash;
-    doc["b"] = body;
-    String json;
-    serializeJson(doc, json);
-    
-    RNS::Packet packet(recipient, RNS::Bytes(json.c_str(), json.length()));
+    RNS::Packet packet(recipient, packetPayload);
     RNS::PacketReceipt receipt = packet.receipt_send();
     if (receipt) {
-        strncpy(nodeStatus, "Sent", sizeof(nodeStatus));
-        INFO("Message sent");
+        strncpy(nodeStatus, "Sent (LXMF)", sizeof(nodeStatus));
+        INFO("LXMF message sent");
     } else {
         strncpy(nodeStatus, "Send failed", sizeof(nodeStatus));
-        WARNING("Message send failed");
+        WARNING("LXMF message send failed");
     }
 }
 

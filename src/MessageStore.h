@@ -21,7 +21,8 @@ struct Message {
 struct Contact {
     char name[32];
     char hash[128];  // Reticulum truncated hex hash (display)
-    RNS::Bytes fullHash; // Full 32-byte identity hash for Identity::recall()
+    RNS::Bytes fullHash;           // Full 32-byte identity hash for Identity::recall()
+    RNS::Bytes identityPublicKey;  // Full identity public key for Ed25519 signature verification
 };
 
 class MessageStore {
