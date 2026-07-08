@@ -26,10 +26,11 @@ Unlike a dumb terminal, ReticuleM runs a full **microReticulum stack** on the de
 | **Mesh Stack** | Native microReticulum (Identity, Destination, Packet, Transport, Path Discovery) |
 | **Interface** | WiFi UDP broadcast on port 4242 (AutoInterface compatible) + optional LoRa (SX1262) |
 | **Crypto** | Ed25519 signatures, X25519 key exchange, AES-128-CBC (handled by microReticulum) |
-| **App Protocol** | Custom `reticulem.inbox` over Reticulum Links/Packets |
-| **Payload** | Compact JSON: `{v:1, n:name, f:hash, b:body}` |
+| **App Protocol** | **LXMF** (`lxmf.delivery`) — MsgPack-encoded LXMessage with Ed25519 signatures (primary) |
+|               | **Legacy fallback** (`reticulem.inbox`) — JSON `{v:1, n:name, f:hash, b:body}` (backward compat) |
+| **Payload** | Binary LXMF wire format (96-byte header + MsgPack) or legacy JSON |
 | **UI** | Splash → Home → Inbox / Compose / Contacts / Settings / Status |
-| **Discovery** | Announces every 60s; incoming announces auto-populate contacts |
+| **Discovery** | Announces every 60s on both `reticulem.inbox` and `lxmf.delivery` aspects; incoming announces auto-populate contacts |
 | **Storage** | Identity persisted to SPIFFS; settings JSON; messages in SRAM |
 
 ## LoRa Interface
@@ -152,11 +153,83 @@ The Cardputer broadcasts to `255.255.255.255:4242` (UDP). The Pi's `AutoInterfac
 
 Incoming packets decrypted by microReticulum are parsed and added to the **Inbox**. The sender's hash and display name are auto-added to **Contacts** if new.
 
-## Optional: LXMF Bridge
+## Sideband / LXMF Compatibility
 
-If you want to bridge `reticulem.inbox` messages to/from the **LXMF** messaging ecosystem, an optional Python bridge can run on the Pi. It acts as a Reticulum node on the LAN and translates between our lightweight JSON payload and LXMF `LXMessage`.
+ReticuleM now supports the **LXMF (Lightweight eXtensible Message Format)**
+wire protocol natively, making it directly compatible with **Sideband**
+(phone/desktop LXMF messaging app by Mark Qvist / unsigned.io).
 
-See `host-bridge/bridge.py` (legacy JSON-over-serial) or adapt it for native Reticulum packet relaying.
+### How It Works
+
+1. **Dual aspect announces**: On boot, ReticuleM announces both the legacy
+   `reticulem.inbox` aspect (plain-text app_data) and the LXMF `lxmf.delivery`
+   aspect (MsgPack-encoded app_data with display name, null stamp cost, and
+   empty features list).
+
+2. **LXMF-first receiving**: Incoming packets are parsed as LXMF wire format
+   first. If parsing succeeds, the message is added to the inbox with Ed25519
+   signature verification attempted (if the source identity is known). If LXMF
+   parsing fails, the legacy JSON format is tried as a fallback.
+
+3. **OPPORTUNISTIC delivery**: Outgoing messages use LXMF OPPORTUNISTIC
+   delivery — the destination hash is stripped from the wire format (Reticulum
+   already routes by it), and the packet is sent to the recipient's
+   `lxmf.delivery` destination.
+
+4. **Signature verification**: Incoming LXMF messages are verified against
+   the sender's Ed25519 public key (stored in contacts). Verification is
+   best-effort — messages from unknown identities are accepted without
+   signature validation. OPPORTUNISTIC messages (no destination hash) cannot
+   be fully verified (known design limitation).
+
+### Wire Format
+
+LXMF messages use a compact binary format over Reticulum packets:
+
+```
+┌─────────────────┬─────────────────┬──────────────────┬──────────────┐
+│ Destination Hash│ Source Hash     │ Ed25519 Signature│ MsgPack      │
+│ (16 bytes)      │ (16 bytes)      │ (64 bytes)       │ Payload      │
+│ (stripped for   │                 │                  │              │
+│  OPPORTUNISTIC) │                 │                  │              │
+└─────────────────┴─────────────────┴──────────────────┴──────────────┘
+```
+
+The MsgPack payload is a 4-element array:
+```
+[
+  timestamp: float64,    // Unix time or uptime seconds
+  title: bin,            // UTF-8 message title (may be empty)
+  content: bin,          // UTF-8 message body
+  fields: map            // LXMF fields (ignored on receive, empty on send)
+]
+```
+
+### LXMF Compatibility Module
+
+The `src/LXMFCompat.h` and `src/LXMFCompat.cpp` files implement the
+LXMF wire format in a self-contained namespace `LXMFCompat`. Key design
+decisions:
+
+- **Manual MsgPack parser**: A byte-level parser handles exactly the subset
+  of MsgPack that LXMF uses (fixarray, float64, bin8/bin16, fixmap, nil),
+  avoiding the template-heavy `MsgPack::Unpacker` on the embedded target.
+- **Signature reconstruction**: Rather than storing raw byte offsets, MsgPack
+  payloads are deterministically rebuilt from parsed fields for Ed25519
+  verification.
+- **Delivery format detection**: A heuristic based on the offset of the
+  MsgPack fixarray marker differentiates DIRECT from OPPORTUNISTIC delivery
+  formats.
+
+**API Summary:**
+
+| Function | Purpose |
+|----------|---------|
+| `packMessage()` | Build LXMF wire format bytes from source identity, destination, title, content |
+| `unpackMessage()` | Parse incoming bytes into `LXMessage` struct (auto-detects DIRECT/OPPORTUNISTIC) |
+| `verifySignature()` | Validate Ed25519 signature against a recalled identity |
+| `encodeAnnounceData()` | Encode display name as MsgPack `[name, null, []]` for LXMF announces |
+| `decodeAnnounceData()` | Extract display name from app_data (supports LXMF MsgPack and legacy UTF-8) |
 
 ## Development Notes
 
@@ -199,7 +272,7 @@ Add this command to your pre-merge checklist. Any code change should pass the sm
 
 ### Limitations
 
-- **No LXMF on-device.** LXMF is not yet implemented in microReticulum. ReticuleM uses its own lightweight app protocol. A bridge can map to LXMF if desired.
+- **LXMF scope limits.** LXMF support is limited to DIRECT and OPPORTUNISTIC delivery methods (as used by Sideband). Stamps/proof-of-work, propagation nodes, fields (attachments, images, audio), and QR/paper delivery are not implemented. See PR #5 scope for details.
 - **RAM messages.** Messages are stored in SRAM and lost on reboot. SPIFFS-based message persistence is a future enhancement.
 - **Path discovery timeout.** Sending to an unknown destination requires an announce from that node within ~30s, or the send fails.
 
